@@ -24,3 +24,6 @@ npm-debug.log*
 *.crt
 *.key
 *.pem
+
+# Codex environment
+.codex/environments/environment.toml

@@ -14,6 +14,8 @@
   "scripts": {
     "build": "webpack --mode production",
     "deploy": "pnpm build && pnpm dlx wrangler pages deploy dist --project-name openexcel",
+    "sideload:mac:prod": "pnpm build && mkdir -p ~/Library/Containers/com.microsoft.Excel/Data/Documents/wef && cp dist/manifest.prod.xml ~/Library/Containers/com.microsoft.Excel/Data/Documents/wef/manifest.xml",
+    "sideload:mac:dev": "mkdir -p ~/Library/Containers/com.microsoft.Excel/Data/Documents/wef && cp -f manifest.xml ~/Library/Containers/com.microsoft.Excel/Data/Documents/wef/manifest.xml",
     "build:dev": "webpack --mode development",
     "dev-server": "webpack serve --mode development",
     "lint": "biome check src/",

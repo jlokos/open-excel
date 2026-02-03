@@ -1,4 +1,4 @@
-# open-excel
+# OpenExcel
 
 An open-source Claude for Excel clone. A Microsoft Office Excel Add-in with an integrated AI chat interface that lets you chat with LLM providers (OpenAI, Anthropic, Google, etc.) directly within Excel using your own API keys (BYOK).
 
@@ -24,10 +24,9 @@ Download [`manifest.prod.xml`](./manifest.prod.xml) and follow the instructions 
    ```
    ~/Library/Containers/com.microsoft.Excel/Data/Documents/wef/
    ```
-   You can do this via Terminal:
+   You can do this via Terminal, or run:
    ```bash
-   mkdir -p ~/Library/Containers/com.microsoft.Excel/Data/Documents/wef
-   cp manifest.prod.xml ~/Library/Containers/com.microsoft.Excel/Data/Documents/wef/
+   pnpm sideload:mac:prod
    ```
 2. Quit and reopen Excel
 3. Go to **Insert** → **Add-ins** → **My Add-ins**
