@@ -16,7 +16,7 @@ import {
 import type { ReactNode } from "react";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { getWorkbookMetadata } from "../../../lib/excel/api";
-import { buildSkillPackageFromMarkdown, type SkillMetadata, type SkillPackage } from "../../../lib/skills";
+import { buildSkillPackageFromMarkdown, extractSkillName, type SkillMetadata, type SkillPackage } from "../../../lib/skills";
 import {
   type ChatSession,
   createSession,
@@ -26,13 +26,20 @@ import {
   getSession,
   listSessions,
   listSkills,
+  listSkillFiles,
   saveSkill,
   upsertSkillPackage,
   deleteSkill as deleteSkillRecord,
   getSkillFile,
   saveSession,
+  getAllOAuthCredentials,
+  saveOAuthCredentials,
+  deleteOAuthCredentials,
+  type OAuthCredentialRecord,
 } from "../../../lib/storage";
 import { EXCEL_TOOLS } from "../../../lib/tools";
+import type { BrowserOAuthProviderId, CustomEndpointConfig, ExtendedProviderConfig } from "./types";
+import type { OAuthCredentials } from "./oauth-login-dialog";
 
 export type ToolCallStatus = "pending" | "running" | "complete" | "error";
 
@@ -57,14 +64,7 @@ export interface ChatMessage {
 
 export type ThinkingLevel = "none" | "low" | "medium" | "high";
 
-export interface ProviderConfig {
-  provider: string;
-  apiKey: string;
-  model: string;
-  useProxy: boolean;
-  proxyUrl: string;
-  thinking: ThinkingLevel;
-}
+export interface ProviderConfig extends ExtendedProviderConfig {}
 
 export interface SessionStats {
   inputTokens: number;
@@ -74,6 +74,17 @@ export interface SessionStats {
   totalCost: number;
   contextWindow: number;
   lastUsage: Usage | null;
+}
+
+interface DebugInfo {
+  requestId: string | null;
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  payloadPreview?: string;
+  payloadSize?: number;
+  error?: string | null;
+  timestamp?: number;
 }
 
 export interface SkillDraftInput {
@@ -93,8 +104,25 @@ export interface SkillDraftInput {
   metadata?: string;
 }
 
+export type OAuthStatus = Record<BrowserOAuthProviderId, boolean>;
+
 const STORAGE_KEY = "openexcel-provider-config";
 const LEGACY_SKILLS_KEY = "openexcel-agent-skills";
+const CUSTOM_PROVIDER_ID = "custom";
+
+const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+const OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_JWT_CLAIM_PATH = "https://api.openai.com/auth";
+
+const COPILOT_HEADERS = {
+  "User-Agent": "GitHubCopilotChat/0.35.0",
+  "Editor-Version": "vscode/1.107.0",
+  "Editor-Plugin-Version": "copilot-chat/0.35.0",
+  "Copilot-Integration-Id": "vscode-chat",
+} as const;
 
 function loadSavedConfig(): ProviderConfig | null {
   try {
@@ -103,6 +131,9 @@ function loadSavedConfig(): ProviderConfig | null {
       const config = JSON.parse(saved);
       if (config.proxyUrl === undefined) {
         config.proxyUrl = "";
+      }
+      if (config.authMethod === undefined) {
+        config.authMethod = "apiKey";
       }
       return config;
     }
@@ -130,6 +161,291 @@ function applyProxyToModel(model: Model<any>, config: ProviderConfig): Model<any
   };
 }
 
+function applyOAuthModelOverrides(
+  model: Model<any>,
+  config: ProviderConfig,
+  oauthCredentials?: OAuthCredentialRecord | null,
+): Model<any> {
+  if (config.authMethod !== "oauth" || !config.oauthProvider || !oauthCredentials) return model;
+
+  if (config.oauthProvider === "github-copilot") {
+    const enterpriseDomain =
+      typeof oauthCredentials.enterpriseUrl === "string"
+        ? normalizeDomain(oauthCredentials.enterpriseUrl) ?? oauthCredentials.enterpriseUrl
+        : undefined;
+    const token = typeof oauthCredentials.access === "string" ? oauthCredentials.access : undefined;
+    const baseUrl = getGitHubCopilotBaseUrl(token, enterpriseDomain);
+    if (baseUrl && baseUrl !== model.baseUrl) {
+      return { ...model, baseUrl };
+    }
+  }
+
+  return model;
+}
+
+function buildCustomModel(endpoint: CustomEndpointConfig): Model<"openai-completions"> {
+  return {
+    id: endpoint.modelId,
+    name: endpoint.modelName || endpoint.modelId,
+    api: "openai-completions",
+    provider: "custom" as any,
+    baseUrl: endpoint.baseUrl,
+    reasoning: false,
+    input: endpoint.supportsImages ? ["text", "image"] : ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: endpoint.contextWindow,
+    maxTokens: endpoint.maxTokens ?? Math.floor(endpoint.contextWindow / 4),
+  };
+}
+
+function buildProxiedUrl(url: string, proxyUrl?: string): string {
+  if (!proxyUrl) return url;
+  return `${proxyUrl}/?url=${encodeURIComponent(url)}`;
+}
+
+function normalizeDomain(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  try {
+    const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
+    return url.hostname;
+  } catch {
+    return null;
+  }
+}
+
+function getBaseUrlFromToken(token: string): string | null {
+  const match = token.match(/proxy-ep=([^;]+)/);
+  if (!match) return null;
+  const proxyHost = match[1];
+  const apiHost = proxyHost.replace(/^proxy\./, "api.");
+  return `https://${apiHost}`;
+}
+
+function getGitHubCopilotBaseUrl(token?: string, enterpriseDomain?: string): string {
+  if (token) {
+    const urlFromToken = getBaseUrlFromToken(token);
+    if (urlFromToken) return urlFromToken;
+  }
+  if (enterpriseDomain) return `https://copilot-api.${enterpriseDomain}`;
+  return "https://api.individual.githubcopilot.com";
+}
+
+function decodeJwt(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const payload = parts[1] ?? "";
+    return JSON.parse(atob(payload)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function getOpenAICodexAccountId(token: string): string | null {
+  const payload = decodeJwt(token);
+  const auth = payload?.[OPENAI_JWT_CLAIM_PATH as keyof typeof payload] as { chatgpt_account_id?: string } | undefined;
+  const accountId = auth?.chatgpt_account_id;
+  return typeof accountId === "string" && accountId.length > 0 ? accountId : null;
+}
+
+function buildPayloadPreview(payload: unknown, maxLen = 4000): { preview: string; size: number } {
+  let text = "";
+  try {
+    text = JSON.stringify(payload, null, 2);
+  } catch {
+    text = String(payload);
+  }
+  const size = text.length;
+  if (text.length > maxLen) {
+    text = `${text.slice(0, maxLen)}\n... truncated (${size - maxLen} chars)`;
+  }
+  return { preview: text, size };
+}
+
+function formatProviderError(message: string, config: ProviderConfig | null): string {
+  if (!config) return message;
+  const normalized = message.toLowerCase();
+  if (config.provider === "openai-codex" && (normalized.includes("load failed") || normalized.includes("failed to fetch"))) {
+    return "OpenAI Codex request failed (network/CORS). Set a CORS proxy in Settings and try again.";
+  }
+  return message;
+}
+
+async function refreshAnthropicToken(
+  refreshToken: string,
+  proxyUrl?: string,
+): Promise<{ access: string; refresh: string; expires: number } | null> {
+  try {
+    const tokenUrl = buildProxiedUrl(ANTHROPIC_TOKEN_URL, proxyUrl);
+    const response = await fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: ANTHROPIC_CLIENT_ID,
+        refresh_token: refreshToken,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("[OAuth] Failed to refresh Anthropic token:", await response.text());
+      return null;
+    }
+
+    const data = await response.json();
+    return {
+      access: data.access_token,
+      refresh: data.refresh_token || refreshToken,
+      expires: Date.now() + (data.expires_in || 3600) * 1000 - 5 * 60 * 1000,
+    };
+  } catch (err) {
+    console.error("[OAuth] Error refreshing Anthropic token:", err);
+    return null;
+  }
+}
+
+async function refreshGitHubCopilotToken(
+  refreshToken: string,
+  enterpriseDomain?: string,
+  proxyUrl?: string,
+): Promise<{ access: string; refresh: string; expires: number; enterpriseUrl?: string } | null> {
+  try {
+    const domain = enterpriseDomain || "github.com";
+    const tokenUrl = buildProxiedUrl(`https://api.${domain}/copilot_internal/v2/token`, proxyUrl);
+    const response = await fetch(tokenUrl, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${refreshToken}`,
+        ...COPILOT_HEADERS,
+      },
+    });
+
+    if (!response.ok) {
+      console.error("[OAuth] Failed to refresh GitHub Copilot token:", await response.text());
+      return null;
+    }
+
+    const data = await response.json();
+    if (!data?.token || typeof data.expires_at !== "number") {
+      console.error("[OAuth] Invalid GitHub Copilot token response:", data);
+      return null;
+    }
+
+    return {
+      access: data.token,
+      refresh: refreshToken,
+      expires: data.expires_at * 1000 - 5 * 60 * 1000,
+      enterpriseUrl: enterpriseDomain,
+    };
+  } catch (err) {
+    console.error("[OAuth] Error refreshing GitHub Copilot token:", err);
+    return null;
+  }
+}
+
+async function refreshOpenAICodexToken(
+  refreshToken: string,
+  proxyUrl?: string,
+): Promise<{ access: string; refresh: string; expires: number; accountId?: string } | null> {
+  try {
+    const tokenUrl = buildProxiedUrl(OPENAI_TOKEN_URL, proxyUrl);
+    const response = await fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: OPENAI_CLIENT_ID,
+      }).toString(),
+    });
+
+    if (!response.ok) {
+      console.error("[OAuth] Failed to refresh OpenAI Codex token:", await response.text());
+      return null;
+    }
+
+    const data = await response.json();
+    if (!data.access_token || !data.refresh_token || typeof data.expires_in !== "number") {
+      console.error("[OAuth] Invalid OpenAI Codex token response:", data);
+      return null;
+    }
+
+    const accountId = getOpenAICodexAccountId(data.access_token);
+
+    return {
+      access: data.access_token,
+      refresh: data.refresh_token,
+      expires: Date.now() + data.expires_in * 1000,
+      accountId: accountId ?? undefined,
+    };
+  } catch (err) {
+    console.error("[OAuth] Error refreshing OpenAI Codex token:", err);
+    return null;
+  }
+}
+
+async function getApiKeyForConfig(
+  config: ProviderConfig,
+  oauthCredentials: OAuthCredentialRecord[],
+  proxyUrl?: string,
+): Promise<{ apiKey: string; updatedCredentials?: OAuthCredentialRecord; credentials?: OAuthCredentialRecord } | null> {
+  if (config.authMethod === "apiKey") {
+    return { apiKey: config.apiKey || "" };
+  }
+
+  if (!config.oauthProvider) {
+    return null;
+  }
+
+  const creds = oauthCredentials.find((c) => c.id === config.oauthProvider);
+  if (!creds) {
+    return null;
+  }
+
+  const now = Date.now();
+  const bufferMs = 5 * 60 * 1000;
+
+  const expires = typeof creds.expires === "number" ? creds.expires : 0;
+  if (expires > now + bufferMs) {
+    return { apiKey: creds.access, credentials: creds };
+  }
+
+  let refreshed: { access: string; refresh: string; expires: number; [key: string]: unknown } | null = null;
+
+  if (config.oauthProvider === "anthropic" && creds.refresh) {
+    refreshed = await refreshAnthropicToken(creds.refresh, proxyUrl);
+  }
+
+  if (config.oauthProvider === "github-copilot" && creds.refresh) {
+    const enterpriseDomain =
+      typeof creds.enterpriseUrl === "string" ? normalizeDomain(creds.enterpriseUrl) ?? creds.enterpriseUrl : undefined;
+    refreshed = await refreshGitHubCopilotToken(creds.refresh, enterpriseDomain, proxyUrl);
+  }
+
+  if (config.oauthProvider === "openai-codex" && creds.refresh) {
+    refreshed = await refreshOpenAICodexToken(creds.refresh, proxyUrl);
+  }
+
+  if (refreshed) {
+    const updatedCredentials: OAuthCredentialRecord = {
+      id: config.oauthProvider,
+      access: refreshed.access,
+      refresh: refreshed.refresh,
+      expires: refreshed.expires,
+      updatedAt: Date.now(),
+      ...refreshed,
+    };
+    return { apiKey: refreshed.access, updatedCredentials, credentials: updatedCredentials };
+  }
+
+  return null;
+}
+
 interface ChatState {
   messages: ChatMessage[];
   isStreaming: boolean;
@@ -138,6 +454,7 @@ interface ChatState {
   sessionStats: SessionStats;
   currentSession: ChatSession | null;
   sessions: ChatSession[];
+  debug: DebugInfo;
 }
 
 const INITIAL_STATS: SessionStats = {
@@ -148,6 +465,11 @@ const INITIAL_STATS: SessionStats = {
   totalCost: 0,
   contextWindow: 0,
   lastUsage: null,
+};
+
+const INITIAL_DEBUG: DebugInfo = {
+  requestId: null,
+  error: null,
 };
 
 interface ChatContextValue {
@@ -167,6 +489,9 @@ interface ChatContextValue {
   removeSkill: (id: string) => Promise<void>;
   loadSkillContent: (id: string) => Promise<string | null>;
   buildSkillDraft: (input: SkillDraftInput) => Promise<string>;
+  oauthStatus: OAuthStatus;
+  loginWithOAuth: (providerId: BrowserOAuthProviderId, credentials: OAuthCredentials) => Promise<void>;
+  logoutOAuth: (providerId: BrowserOAuthProviderId) => Promise<void>;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -314,7 +639,10 @@ function extractPartsFromAssistantMessage(message: AgentMessage, existingParts: 
 export function ChatProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<ChatState>(() => {
     const saved = loadSavedConfig();
-    const validConfig = saved?.provider && saved?.apiKey && saved?.model ? saved : null;
+    const isCustom = saved?.provider === CUSTOM_PROVIDER_ID;
+    const hasAuth = saved?.authMethod === "oauth" ? saved?.oauthProvider : saved?.apiKey;
+    const hasModel = isCustom ? saved?.customEndpoint?.modelId : saved?.model;
+    const validConfig = saved?.provider && hasAuth && hasModel ? saved : null;
     return {
       messages: [],
       isStreaming: false,
@@ -323,10 +651,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       sessionStats: INITIAL_STATS,
       currentSession: null,
       sessions: [],
+      debug: INITIAL_DEBUG,
     };
   });
   const [skills, setSkills] = useState<SkillMetadata[]>([]);
   const [skillBodies, setSkillBodies] = useState<Record<string, string>>({});
+  const OAUTH_PROVIDER_IDS: BrowserOAuthProviderId[] = ["anthropic", "github-copilot", "openai-codex"];
+
+  const [oauthStatus, setOauthStatus] = useState<OAuthStatus>(() =>
+    Object.fromEntries(OAUTH_PROVIDER_IDS.map((id) => [id, false])) as OAuthStatus,
+  );
+  const [oauthCredentials, setOauthCredentials] = useState<OAuthCredentialRecord[]>([]);
 
   const agentRef = useRef<Agent | null>(null);
   const streamingMessageIdRef = useRef<string | null>(null);
@@ -338,10 +673,16 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const currentSessionIdRef = useRef<string | null>(null);
   const providerConfigRef = useRef<ProviderConfig | null>(state.providerConfig);
   const systemPromptRef = useRef<string>(SYSTEM_PROMPT);
+  const oauthCredentialsRef = useRef<OAuthCredentialRecord[]>([]);
+
+  useEffect(() => {
+    oauthCredentialsRef.current = oauthCredentials;
+  }, [oauthCredentials]);
 
   const availableProviders = getProviders();
 
   const getModelsForProvider = useCallback((provider: string): Model<any>[] => {
+    if (provider === CUSTOM_PROVIDER_ID) return [];
     try {
       return getModels(provider as any);
     } catch {
@@ -357,58 +698,81 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           const id = generateId();
           streamingMessageIdRef.current = id;
           const parts = extractPartsFromAssistantMessage(event.message);
+          const chatMessage: ChatMessage = {
+            id,
+            role: "assistant",
+            parts,
+            timestamp: event.message.timestamp,
+          };
           setState((prev) => ({
             ...prev,
-            messages: [
-              ...prev.messages,
-              {
-                id,
-                role: "assistant",
-                parts,
-                timestamp: Date.now(),
-              },
-            ],
+            messages: [...prev.messages, chatMessage],
           }));
         }
         break;
       }
       case "message_update": {
         if (event.message.role === "assistant" && streamingMessageIdRef.current) {
-          const msgId = streamingMessageIdRef.current;
           setState((prev) => {
-            const msgIndex = prev.messages.findIndex((m) => m.id === msgId);
-            if (msgIndex === -1) return prev;
-            const existing = prev.messages[msgIndex];
-            const parts = extractPartsFromAssistantMessage(event.message, existing.parts);
-            const updated = [...prev.messages];
-            updated[msgIndex] = { ...existing, parts };
-            return { ...prev, messages: updated };
+            const messages = [...prev.messages];
+            const idx = messages.findIndex((m) => m.id === streamingMessageIdRef.current);
+            if (idx !== -1) {
+              const parts = extractPartsFromAssistantMessage(event.message, messages[idx].parts);
+              messages[idx] = { ...messages[idx], parts };
+            }
+            return { ...prev, messages };
           });
         }
         break;
       }
       case "message_end": {
-        if (event.message.role === "assistant" && streamingMessageIdRef.current) {
-          const msgId = streamingMessageIdRef.current;
+        if (event.message.role === "assistant") {
           const assistantMsg = event.message as AssistantMessage;
+          const isError = assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted";
+          const rawError = assistantMsg.errorMessage || "Request failed";
+          const formattedError = isError ? formatProviderError(rawError, providerConfigRef.current) : null;
+          console.log("[Chat] Assistant message result:", event.message);
+          console.log("[Chat] Usage:", assistantMsg.usage);
+          console.log("[Chat] stopReason:", assistantMsg.stopReason, "errorMessage:", assistantMsg.errorMessage);
+
           setState((prev) => {
-            const msgIndex = prev.messages.findIndex((m) => m.id === msgId);
-            if (msgIndex === -1) return prev;
-            const existing = prev.messages[msgIndex];
-            const parts = extractPartsFromAssistantMessage(event.message, existing.parts);
-            const updated = [...prev.messages];
-            updated[msgIndex] = { ...existing, parts };
-            const stats = { ...prev.sessionStats };
-            if (assistantMsg.usage) {
-              stats.inputTokens += assistantMsg.usage.input ?? 0;
-              stats.outputTokens += assistantMsg.usage.output ?? 0;
-              stats.cacheRead += assistantMsg.usage.cacheRead ?? 0;
-              stats.cacheWrite += assistantMsg.usage.cacheWrite ?? 0;
-              stats.totalCost += assistantMsg.usage.cost?.total ?? 0;
-              stats.lastUsage = assistantMsg.usage;
+            const messages = [...prev.messages];
+            const idx = messages.findIndex((m) => m.id === streamingMessageIdRef.current);
+
+            if (isError) {
+              if (idx !== -1) {
+                messages.splice(idx, 1);
+              }
+            } else if (idx !== -1) {
+              const parts = extractPartsFromAssistantMessage(event.message, messages[idx].parts);
+              messages[idx] = { ...messages[idx], parts };
             }
-            return { ...prev, messages: updated, sessionStats: stats };
+
+            return {
+              ...prev,
+              messages,
+              error: isError ? formattedError || rawError : prev.error,
+              debug: isError
+                ? {
+                    ...prev.debug,
+                    error: rawError,
+                    timestamp: Date.now(),
+                  }
+                : prev.debug,
+              sessionStats: isError
+                ? prev.sessionStats
+                : {
+                    inputTokens: prev.sessionStats.inputTokens + assistantMsg.usage.input,
+                    outputTokens: prev.sessionStats.outputTokens + assistantMsg.usage.output,
+                    cacheRead: prev.sessionStats.cacheRead + assistantMsg.usage.cacheRead,
+                    cacheWrite: prev.sessionStats.cacheWrite + assistantMsg.usage.cacheWrite,
+                    totalCost: prev.sessionStats.totalCost + assistantMsg.usage.cost.total,
+                    contextWindow: prev.sessionStats.contextWindow,
+                    lastUsage: assistantMsg.usage,
+                  },
+            };
           });
+          streamingMessageIdRef.current = null;
         }
         break;
       }
@@ -432,6 +796,37 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         });
         break;
       }
+      case "tool_execution_update": {
+        setState((prev) => {
+          const messages = [...prev.messages];
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            const partIdx = msg.parts.findIndex((p) => p.type === "toolCall" && p.id === event.toolCallId);
+            if (partIdx !== -1) {
+              const parts = [...msg.parts];
+              const part = parts[partIdx];
+              if (part.type === "toolCall") {
+                let partialText: string;
+                if (typeof event.partialResult === "string") {
+                  partialText = event.partialResult;
+                } else if (event.partialResult?.content && Array.isArray(event.partialResult.content)) {
+                  partialText = event.partialResult.content
+                    .filter((c: { type: string }) => c.type === "text")
+                    .map((c: { text: string }) => c.text)
+                    .join("\n");
+                } else {
+                  partialText = JSON.stringify(event.partialResult, null, 2);
+                }
+                parts[partIdx] = { ...part, result: partialText };
+                messages[i] = { ...msg, parts };
+              }
+              break;
+            }
+          }
+          return { ...prev, messages };
+        });
+        break;
+      }
       case "tool_execution_end": {
         setState((prev) => {
           const messages = [...prev.messages];
@@ -442,12 +837,18 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               const parts = [...msg.parts];
               const part = parts[partIdx];
               if (part.type === "toolCall") {
-                const isError = event.result.type === "error";
-                parts[partIdx] = {
-                  ...part,
-                  status: isError ? "error" : "complete",
-                  result: event.result.result,
-                };
+                let resultText: string;
+                if (typeof event.result === "string") {
+                  resultText = event.result;
+                } else if (event.result?.content && Array.isArray(event.result.content)) {
+                  resultText = event.result.content
+                    .filter((c: { type: string }) => c.type === "text")
+                    .map((c: { text: string }) => c.text)
+                    .join("\n");
+                } else {
+                  resultText = JSON.stringify(event.result, null, 2);
+                }
+                parts[partIdx] = { ...part, status: event.isError ? "error" : "complete", result: resultText };
                 messages[i] = { ...msg, parts };
               }
               break;
@@ -457,39 +858,45 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         });
         break;
       }
-      case "turn_end": {
+      case "agent_end": {
         isStreamingRef.current = false;
-        streamingMessageIdRef.current = null;
         setState((prev) => ({ ...prev, isStreaming: false }));
-        if (currentSessionIdRef.current) {
-          setState((prev) => {
-            saveSession(currentSessionIdRef.current!, prev.messages).catch(console.error);
-            return prev;
-          });
-        }
+        streamingMessageIdRef.current = null;
         break;
       }
     }
   }, []);
 
   const applyConfig = useCallback(
-    (config: ProviderConfig, systemPrompt: string, apiKey: string) => {
-      console.log("[Chat] applyConfig:", config.provider, config.model);
-
+    async (config: ProviderConfig, systemPrompt: string, apiKey: string) => {
+      let contextWindow = 0;
       let baseModel: Model<any>;
-      try {
-        baseModel = getModel(config.provider as any, config.model as any);
-      } catch (err) {
-        console.error("[Chat] Failed to get model:", err);
-        setState((prev) => ({
-          ...prev,
-          error: `Invalid model: ${config.model}`,
-          providerConfig: config,
-        }));
-        return;
+
+      const isCustom = config.provider === CUSTOM_PROVIDER_ID;
+
+      if (isCustom && config.customEndpoint) {
+        baseModel = buildCustomModel(config.customEndpoint);
+        contextWindow = config.customEndpoint.contextWindow;
+      } else {
+        try {
+          baseModel = getModel(config.provider as any, config.model as any);
+          contextWindow = baseModel.contextWindow;
+        } catch {
+          return;
+        }
       }
 
-      const proxiedModel = applyProxyToModel(baseModel, config);
+      const oauthCreds =
+        config.authMethod === "oauth" && config.oauthProvider
+          ? oauthCredentialsRef.current.find((c) => c.id === config.oauthProvider)
+          : null;
+      const oauthModel = isCustom ? baseModel : applyOAuthModelOverrides(baseModel, config, oauthCreds);
+      const proxiedModel = isCustom ? oauthModel : applyProxyToModel(oauthModel, config);
+      const existingMessages = agentRef.current?.state.messages ?? [];
+
+      if (agentRef.current) {
+        agentRef.current.abort();
+      }
 
       const agent = new Agent({
         initialState: {
@@ -497,32 +904,59 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           systemPrompt,
           thinkingLevel: thinkingLevelToAgent(config.thinking),
           tools: EXCEL_TOOLS,
-          messages: [],
+          messages: existingMessages,
         },
         streamFn: (model, context, options) => {
-          console.log("[Chat] streamFn called with model:", model.id, "context messages:", context.messages.length);
+          const requestId = generateId();
           return streamSimple(model, context, {
             ...options,
             apiKey,
+            onPayload: (payload) => {
+              options?.onPayload?.(payload);
+              const { preview, size } = buildPayloadPreview(payload);
+              console.log("[Chat] Request payload:", {
+                requestId,
+                provider: model.provider,
+                model: model.id,
+                baseUrl: model.baseUrl,
+                payload,
+              });
+              setState((prev) => ({
+                ...prev,
+                debug: {
+                  requestId,
+                  provider: model.provider,
+                  model: model.id,
+                  baseUrl: model.baseUrl,
+                  payloadPreview: preview,
+                  payloadSize: size,
+                  error: null,
+                  timestamp: Date.now(),
+                },
+              }));
+            },
           });
         },
       });
-      agent.subscribe(handleAgentEvent);
       agentRef.current = agent;
-
+      agent.subscribe(handleAgentEvent);
       pendingConfigRef.current = null;
       pendingSystemPromptRef.current = null;
       providerConfigRef.current = config;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+
+      console.log("[Chat] Model info:", {
+        id: baseModel.id,
+        contextWindow: baseModel.contextWindow,
+        maxTokens: baseModel.maxTokens,
+        cost: baseModel.cost,
+        reasoning: baseModel.reasoning,
+      });
 
       setState((prev) => ({
         ...prev,
         providerConfig: config,
         error: null,
-        sessionStats: {
-          ...prev.sessionStats,
-          contextWindow: proxiedModel.contextWindow ?? 0,
-        },
+        sessionStats: { ...prev.sessionStats, contextWindow },
       }));
     },
     [handleAgentEvent],
@@ -530,8 +964,36 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const setProviderConfig = useCallback(
     async (config: ProviderConfig) => {
-      console.log("[Chat] setProviderConfig:", config);
       providerConfigRef.current = config;
+
+      const result = await getApiKeyForConfig(config, oauthCredentialsRef.current, config.proxyUrl);
+      if (!result) {
+        setState((prev) => ({
+          ...prev,
+          providerConfig: config,
+          error: config.authMethod === "oauth" ? `Not logged in with ${config.oauthProvider}` : null,
+        }));
+        return;
+      }
+
+      if (result.updatedCredentials) {
+        await saveOAuthCredentials(result.updatedCredentials.id, {
+          refresh: result.updatedCredentials.refresh,
+          access: result.updatedCredentials.access,
+          expires: result.updatedCredentials.expires,
+          ...result.updatedCredentials,
+        });
+        const next = (() => {
+          const existing = oauthCredentialsRef.current;
+          const idx = existing.findIndex((c) => c.id === result.updatedCredentials!.id);
+          if (idx === -1) return [...existing, result.updatedCredentials!];
+          const updated = [...existing];
+          updated[idx] = result.updatedCredentials!;
+          return updated;
+        })();
+        oauthCredentialsRef.current = next;
+        setOauthCredentials(next);
+      }
 
       if (isStreamingRef.current) {
         pendingConfigRef.current = config;
@@ -539,7 +1001,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      await applyConfig(config, systemPromptRef.current, config.apiKey);
+      await applyConfig(config, systemPromptRef.current, result.apiKey);
     },
     [applyConfig],
   );
@@ -564,17 +1026,55 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      if (config.provider === "openai-codex" && (!config.useProxy || !config.proxyUrl)) {
+        const message = "OpenAI Codex requires a CORS proxy in this browser. Enable the proxy and add a proxy URL.";
+        setState((prev) => ({
+          ...prev,
+          error: message,
+          debug: { ...prev.debug, error: message, timestamp: Date.now() },
+        }));
+        return;
+      }
+
+      const result = await getApiKeyForConfig(config, oauthCredentialsRef.current, config.proxyUrl);
+      if (!result) {
+        setState((prev) => ({
+          ...prev,
+          error: config.authMethod === "oauth" ? `Not logged in with ${config.oauthProvider}` : "No API key configured",
+        }));
+        return;
+      }
+
+      if (result.updatedCredentials) {
+        await saveOAuthCredentials(result.updatedCredentials.id, {
+          refresh: result.updatedCredentials.refresh,
+          access: result.updatedCredentials.access,
+          expires: result.updatedCredentials.expires,
+          ...result.updatedCredentials,
+        });
+        const next = (() => {
+          const existing = oauthCredentialsRef.current;
+          const idx = existing.findIndex((c) => c.id === result.updatedCredentials!.id);
+          if (idx === -1) return [...existing, result.updatedCredentials!];
+          const updated = [...existing];
+          updated[idx] = result.updatedCredentials!;
+          return updated;
+        })();
+        oauthCredentialsRef.current = next;
+        setOauthCredentials(next);
+      }
+
       const pendingConfig = pendingConfigRef.current;
       const pendingSystemPrompt = pendingSystemPromptRef.current;
       if (pendingConfig || pendingSystemPrompt) {
         const nextConfig = pendingConfig ?? config;
         const nextPrompt = pendingSystemPrompt ?? systemPromptRef.current;
-        await applyConfig(nextConfig, nextPrompt, nextConfig.apiKey);
+        await applyConfig(nextConfig, nextPrompt, result.apiKey);
       }
 
       const agent = agentRef.current;
       if (!agent) {
-        await applyConfig(config, systemPromptRef.current, config.apiKey);
+        await applyConfig(config, systemPromptRef.current, result.apiKey);
       }
 
       const userMessage: ChatMessage = {
@@ -611,6 +1111,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           ...prev,
           isStreaming: false,
           error: err instanceof Error ? err.message : "An error occurred",
+          debug: {
+            ...prev.debug,
+            error: err instanceof Error ? err.message : "An error occurred",
+            timestamp: Date.now(),
+          },
         }));
       }
     },
@@ -623,7 +1128,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     if (currentSessionIdRef.current) {
       saveSession(currentSessionIdRef.current, []).catch(console.error);
     }
-    setState((prev) => ({ ...prev, messages: [], error: null, sessionStats: INITIAL_STATS }));
+    setState((prev) => ({ ...prev, messages: [], error: null, sessionStats: INITIAL_STATS, debug: INITIAL_DEBUG }));
   }, [abort]);
 
   const refreshSessions = useCallback(async () => {
@@ -693,138 +1198,226 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const deleteCurrentSession = useCallback(async () => {
-    const sessionId = currentSessionIdRef.current;
-    if (!sessionId || !workbookIdRef.current) return;
-    if (isStreamingRef.current) return;
-    agentRef.current?.reset();
-    try {
-      await deleteSession(sessionId);
-      const remaining = await listSessions(workbookIdRef.current);
-      if (remaining.length > 0) {
-        const next = remaining[0];
-        currentSessionIdRef.current = next.id;
-        setState((prev) => ({
-          ...prev,
-          messages: next.messages,
-          currentSession: next,
-          sessions: remaining,
-          error: null,
-          sessionStats: INITIAL_STATS,
-        }));
-      } else {
-        const newSess = await createSession(workbookIdRef.current);
-        currentSessionIdRef.current = newSess.id;
-        setState((prev) => ({
-          ...prev,
-          messages: [],
-          currentSession: newSess,
-          sessions: [newSess],
-          error: null,
-          sessionStats: INITIAL_STATS,
-        }));
-      }
-    } catch (err) {
-      console.error("[Chat] Failed to delete session:", err);
+    if (!currentSessionIdRef.current || !workbookIdRef.current) return;
+    if (isStreamingRef.current) {
+      console.log("[Chat] deleteCurrentSession blocked: streaming in progress");
+      return;
     }
+    agentRef.current?.reset();
+    await deleteSession(currentSessionIdRef.current);
+    const session = await getOrCreateCurrentSession(workbookIdRef.current);
+    currentSessionIdRef.current = session.id;
+    await refreshSessions();
+    setState((prev) => ({
+      ...prev,
+      messages: session.messages,
+      currentSession: session,
+      error: null,
+      sessionStats: INITIAL_STATS,
+    }));
+  }, [refreshSessions]);
+
+  const loginWithOAuth = useCallback(async (providerId: BrowserOAuthProviderId, credentials: OAuthCredentials) => {
+    await saveOAuthCredentials(providerId, credentials);
+    const newCred: OAuthCredentialRecord = {
+      id: providerId,
+      ...credentials,
+      updatedAt: Date.now(),
+    };
+    const next = (() => {
+      const existing = oauthCredentialsRef.current;
+      const idx = existing.findIndex((c) => c.id === providerId);
+      if (idx === -1) return [...existing, newCred];
+      const updated = [...existing];
+      updated[idx] = newCred;
+      return updated;
+    })();
+    oauthCredentialsRef.current = next;
+    setOauthCredentials(next);
+    setOauthStatus((prev) => ({ ...prev, [providerId]: true }));
   }, []);
 
-  // Initialize workbook and session
+  const logoutOAuth = useCallback(async (providerId: BrowserOAuthProviderId) => {
+    await deleteOAuthCredentials(providerId);
+    const next = oauthCredentialsRef.current.filter((c) => c.id !== providerId);
+    oauthCredentialsRef.current = next;
+    setOauthCredentials(next);
+    setOauthStatus((prev) => ({ ...prev, [providerId]: false }));
+  }, []);
+
+  const prevStreamingRef = useRef(false);
+  useEffect(() => {
+    if (prevStreamingRef.current && !state.isStreaming && currentSessionIdRef.current) {
+      const sessionId = currentSessionIdRef.current;
+      saveSession(sessionId, state.messages)
+        .then(async () => {
+          await refreshSessions();
+          const updated = await getSession(sessionId);
+          if (updated) {
+            setState((prev) => ({ ...prev, currentSession: updated }));
+          }
+        })
+        .catch(console.error);
+    }
+    prevStreamingRef.current = state.isStreaming;
+  }, [state.isStreaming, state.messages, refreshSessions]);
+
+  useEffect(() => {
+    return () => {
+      agentRef.current?.abort();
+    };
+  }, []);
+
   useEffect(() => {
     if (sessionLoadedRef.current) return;
     sessionLoadedRef.current = true;
 
-    (async () => {
-      try {
-        const workbookId = await getOrCreateWorkbookId();
-        workbookIdRef.current = workbookId;
-        console.log("[Chat] Workbook ID:", workbookId);
-        const session = await getOrCreateCurrentSession(workbookId);
+    getOrCreateWorkbookId()
+      .then(async (id) => {
+        workbookIdRef.current = id;
+        console.log("[Chat] Workbook ID:", id);
+        const session = await getOrCreateCurrentSession(id);
         currentSessionIdRef.current = session.id;
-        const sessions = await listSessions(workbookId);
+        const sessions = await listSessions(id);
+        console.log("[Chat] Loaded session:", session.id, "with", session.messages.length, "messages");
         setState((prev) => ({
           ...prev,
           messages: session.messages,
           currentSession: session,
           sessions,
         }));
-      } catch (err) {
+      })
+      .catch((err) => {
         console.error("[Chat] Failed to load session:", err);
-      }
-    })();
+      });
   }, []);
 
-  // Load skills from DB and migrate legacy skills
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const dbSkills = await listSkills();
-      if (cancelled) return;
-      if (dbSkills.length > 0) {
-        setSkills(dbSkills);
-        return;
-      }
-      const legacy = loadLegacySkills();
-      if (legacy.length === 0) return;
-      const migrated: SkillMetadata[] = [];
-      for (const entry of legacy) {
-        if (!entry.content) continue;
-        const result = buildSkillPackageFromMarkdown({
-          content: entry.content,
-          sourceType: (entry.sourceType as "file" | "url" | "paste") || "paste",
-          source: entry.source,
-          enabled: entry.enabled ?? false,
-        });
-        if (result.errors.length > 0 || !result.skill) continue;
-        const files = result.skill.files.map((file) => ({
-          ...file,
-          id: `${result.skill!.metadata.id}:${file.path}`,
-          skillId: result.skill!.metadata.id,
-        }));
-        await upsertSkillPackage(result.skill.metadata, files);
-        migrated.push(result.skill.metadata);
-      }
-      if (cancelled) return;
-      if (migrated.length > 0) {
-        localStorage.removeItem(LEGACY_SKILLS_KEY);
-        setSkills(migrated);
-      }
-    })().catch((err) => console.error("[Chat] Failed to load skills:", err));
-    return () => {
-      cancelled = true;
-    };
+    getAllOAuthCredentials()
+      .then((creds) => {
+        setOauthCredentials(creds);
+        const status = Object.fromEntries(OAUTH_PROVIDER_IDS.map((id) => [id, false])) as OAuthStatus;
+        for (const cred of creds) {
+          if (OAUTH_PROVIDER_IDS.includes(cred.id as BrowserOAuthProviderId)) {
+            status[cred.id as BrowserOAuthProviderId] = true;
+          }
+        }
+        setOauthStatus(status);
+      })
+      .catch((err) => console.error("[Chat] Failed to load OAuth credentials:", err));
   }, []);
 
-  // Load skill bodies for enabled skills
   useEffect(() => {
-    let cancelled = false;
-    const enabledSkills = skills.filter((s) => s.enabled);
-    if (enabledSkills.length === 0) {
-      setSkillBodies({});
-      return () => {
-        cancelled = true;
-      };
+    const saved = loadSavedConfig();
+    if (saved?.provider) {
+      const isCustom = saved.provider === CUSTOM_PROVIDER_ID;
+      const hasAuth = saved.authMethod === "oauth" ? saved.oauthProvider : saved.apiKey;
+      const hasModel = isCustom ? saved.customEndpoint?.modelId : saved.model;
+      if (hasAuth && hasModel) {
+        setProviderConfig(saved);
+      }
     }
-    (async () => {
-      if (cancelled) return;
-      const entries = await Promise.all(
-        enabledSkills.map(async (skill) => {
-          const content = await loadSkillContent(skill.id);
-          return content ? [skill.id, content] : null;
-        }),
-      );
-      if (cancelled) return;
-      const nextBodies: Record<string, string> = {};
-      for (const entry of entries) {
-        if (entry) nextBodies[entry[0]] = entry[1];
-      }
-      setSkillBodies(nextBodies);
-    })().catch((err) => console.error("[Chat] Failed to load skills:", err));
+  }, [setProviderConfig]);
+
+  useEffect(() => {
+    let cancelled = false;
+    listSkills()
+      .then(async (loaded) => {
+        if (cancelled) return;
+        let resolved = loaded;
+        const legacy = loadLegacySkills();
+        let hadLegacyErrors = false;
+        const legacyByName = new Map<string, { content: string; enabled?: boolean; sourceType?: string; source?: string }>();
+
+        if (legacy.length > 0) {
+          for (const legacySkill of legacy) {
+            const content = legacySkill.content;
+            if (!content) continue;
+            const name = extractSkillName(content);
+            if (name) {
+              legacyByName.set(name, { ...legacySkill, content });
+            }
+          }
+        }
+
+        if (resolved.length === 0 && legacy.length > 0) {
+          for (const legacySkill of legacy) {
+            if (!legacySkill.content) continue;
+            const result = buildSkillPackageFromMarkdown({
+              content: legacySkill.content,
+              sourceType: "paste",
+              source: legacySkill.source,
+              enabled: legacySkill.enabled ?? false,
+            });
+            if (!result.skill) {
+              console.warn("[Chat] Skipping legacy skill:", result.errors.join(" "));
+              hadLegacyErrors = true;
+              continue;
+            }
+            const files = result.skill.files.map((file) => ({
+              ...file,
+              id: `${result.skill?.metadata.id}:${file.path}`,
+              skillId: result.skill?.metadata.id,
+            }));
+            await upsertSkillPackage(result.skill.metadata, files);
+          }
+          if (!hadLegacyErrors) {
+            localStorage.removeItem(LEGACY_SKILLS_KEY);
+          }
+          resolved = await listSkills();
+        }
+
+        if (resolved.length > 0 && legacyByName.size > 0) {
+          let repairedMissing = false;
+          for (const skill of resolved) {
+            const existingSkillMd = await getSkillFile(skill.id, "SKILL.md");
+            if (existingSkillMd && existingSkillMd.content && existingSkillMd.content.length > 0) continue;
+            const legacySkill = legacyByName.get(skill.name) ?? legacyByName.get(skill.id);
+            if (!legacySkill?.content) continue;
+            const existingFiles = await listSkillFiles(skill.id);
+            const skillMdFile = {
+              id: `${skill.id}:SKILL.md`,
+              skillId: skill.id,
+              path: "SKILL.md",
+              content: legacySkill.content,
+              encoding: "utf-8" as const,
+              mimeType: "text/markdown",
+              size: legacySkill.content.length,
+            };
+            const nextFiles = [...existingFiles, skillMdFile];
+            await upsertSkillPackage(skill, nextFiles);
+            repairedMissing = true;
+          }
+          if (repairedMissing) {
+            resolved = await listSkills();
+          }
+        }
+
+        setSkills(resolved);
+        const enabledSkills = resolved.filter((skill) => skill.enabled);
+        if (enabledSkills.length === 0) {
+          setSkillBodies({});
+          return;
+        }
+        const entries = await Promise.all(
+          enabledSkills.map(async (skill) => {
+            const content = await loadSkillContent(skill.id);
+            return content ? [skill.id, content] : null;
+          }),
+        );
+        if (cancelled) return;
+        const nextBodies: Record<string, string> = {};
+        for (const entry of entries) {
+          if (entry) nextBodies[entry[0]] = entry[1];
+        }
+        setSkillBodies(nextBodies);
+      })
+      .catch((err) => console.error("[Chat] Failed to load skills:", err));
     return () => {
       cancelled = true;
     };
-  }, [loadSkillContent, skills]);
+  }, [loadSkillContent]);
 
-  // Update system prompt when skills change
   useEffect(() => {
     const prompt = buildSystemPrompt(skills, skillBodies);
     systemPromptRef.current = prompt;
@@ -834,7 +1427,29 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       pendingSystemPromptRef.current = prompt;
       return;
     }
-    applyConfig(config, prompt, config.apiKey);
+
+    getApiKeyForConfig(config, oauthCredentialsRef.current, config.proxyUrl).then((result) => {
+      if (!result) return;
+      if (result.updatedCredentials) {
+        saveOAuthCredentials(result.updatedCredentials.id, {
+          refresh: result.updatedCredentials.refresh,
+          access: result.updatedCredentials.access,
+          expires: result.updatedCredentials.expires,
+          ...result.updatedCredentials,
+        }).catch(console.error);
+        const next = (() => {
+          const existing = oauthCredentialsRef.current;
+          const idx = existing.findIndex((c) => c.id === result.updatedCredentials!.id);
+          if (idx === -1) return [...existing, result.updatedCredentials!];
+          const updated = [...existing];
+          updated[idx] = result.updatedCredentials!;
+          return updated;
+        })();
+        oauthCredentialsRef.current = next;
+        setOauthCredentials(next);
+      }
+      applyConfig(config, prompt, result.apiKey);
+    });
   }, [skills, skillBodies, applyConfig]);
 
   const upsertSkill = useCallback(
@@ -914,14 +1529,49 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       throw new Error("Configure an API provider to generate a draft with AI.");
     }
 
-    let baseModel: Model<any>;
-    try {
-      baseModel = getModel(config.provider as any, config.model as any);
-    } catch {
-      throw new Error("Invalid model configuration.");
+    const result = await getApiKeyForConfig(config, oauthCredentialsRef.current, config.proxyUrl);
+    if (!result) {
+      throw new Error(config.authMethod === "oauth" ? `Not logged in with ${config.oauthProvider}` : "No API key configured");
     }
 
-    const proxiedModel = applyProxyToModel(baseModel, config);
+    if (result.updatedCredentials) {
+      await saveOAuthCredentials(result.updatedCredentials.id, {
+        refresh: result.updatedCredentials.refresh,
+        access: result.updatedCredentials.access,
+        expires: result.updatedCredentials.expires,
+        ...result.updatedCredentials,
+      });
+      const next = (() => {
+        const existing = oauthCredentialsRef.current;
+        const idx = existing.findIndex((c) => c.id === result.updatedCredentials!.id);
+        if (idx === -1) return [...existing, result.updatedCredentials!];
+        const updated = [...existing];
+        updated[idx] = result.updatedCredentials!;
+        return updated;
+      })();
+      oauthCredentialsRef.current = next;
+      setOauthCredentials(next);
+    }
+
+    let baseModel: Model<any>;
+    const isCustom = config.provider === CUSTOM_PROVIDER_ID;
+
+    if (isCustom && config.customEndpoint) {
+      baseModel = buildCustomModel(config.customEndpoint);
+    } else {
+      try {
+        baseModel = getModel(config.provider as any, config.model as any);
+      } catch {
+        throw new Error("Invalid model configuration.");
+      }
+    }
+
+    const oauthCreds =
+      config.authMethod === "oauth" && config.oauthProvider
+        ? result.credentials ?? oauthCredentialsRef.current.find((c) => c.id === config.oauthProvider)
+        : null;
+    const oauthModel = isCustom ? baseModel : applyOAuthModelOverrides(baseModel, config, oauthCreds);
+    const proxiedModel = isCustom ? oauthModel : applyProxyToModel(oauthModel, config);
     const draftAgent = new Agent({
       initialState: {
         model: proxiedModel,
@@ -933,7 +1583,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       streamFn: (model, context, options) => {
         return streamSimple(model, context, {
           ...options,
-          apiKey: config.apiKey,
+          apiKey: result.apiKey,
         });
       },
     });
@@ -968,6 +1618,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         removeSkill,
         loadSkillContent,
         buildSkillDraft,
+        oauthStatus,
+        loginWithOAuth,
+        logoutOAuth,
       }}
     >
       {children}

@@ -1,4 +1,4 @@
-import { Check, ChevronDown, MessageSquare, Moon, Plus, Puzzle, Settings, Sun, Trash2 } from "lucide-react";
+import { Check, ChevronDown, MessageSquare, Moon, Plus, Settings, Sun, Trash2 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { ChatProvider, useChat } from "./chat-context";
 import { ChatInput } from "./chat-input";
@@ -253,7 +253,7 @@ function ChatHeader({
             Settings
           </TabButton>
           <TabButton active={activeTab === "skills"} onClick={() => onTabChange("skills")}>
-            <Puzzle size={12} />
+            <Plus size={12} />
             Skills
           </TabButton>
         </div>

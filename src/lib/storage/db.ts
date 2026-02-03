@@ -18,10 +18,20 @@ export interface SkillFileRecord extends SkillFileEntry {
   skillId: string;
 }
 
+export interface OAuthCredentialRecord {
+  id: string;
+  refresh: string;
+  access: string;
+  expires: number;
+  updatedAt: number;
+  [key: string]: unknown;
+}
+
 class OpenExcelDB extends Dexie {
   sessions!: Table<ChatSession, string>;
   skills!: Table<SkillRecord, string>;
   skillFiles!: Table<SkillFileRecord, string>;
+  oauthCredentials!: Table<OAuthCredentialRecord, string>;
 
   constructor() {
     super("OpenExcelDB_v3");
@@ -32,6 +42,12 @@ class OpenExcelDB extends Dexie {
       sessions: "id, workbookId, updatedAt",
       skills: "id, name, updatedAt, enabled",
       skillFiles: "id, skillId, path",
+    });
+    this.version(3).stores({
+      sessions: "id, workbookId, updatedAt",
+      skills: "id, name, updatedAt, enabled",
+      skillFiles: "id, skillId, path",
+      oauthCredentials: "id, updatedAt",
     });
   }
 }
@@ -178,4 +194,38 @@ export async function upsertSkillPackage(skill: SkillRecord, files: SkillFileRec
       .then(() => (files.length > 0 ? db.skillFiles.bulkPut(files) : undefined))
       .then(() => undefined);
   });
+}
+
+export async function getOAuthCredentials(providerId: string): Promise<OAuthCredentialRecord | undefined> {
+  return db.oauthCredentials.get(providerId);
+}
+
+export async function saveOAuthCredentials(
+  providerId: string,
+  credentials: { refresh: string; access: string; expires: number; [key: string]: unknown },
+): Promise<void> {
+  const { refresh, access, expires, id: _id, updatedAt: _updatedAt, ...rest } = credentials as {
+    refresh: string;
+    access: string;
+    expires: number;
+    id?: string;
+    updatedAt?: number;
+    [key: string]: unknown;
+  };
+  await db.oauthCredentials.put({
+    id: providerId,
+    refresh,
+    access,
+    expires,
+    updatedAt: Date.now(),
+    ...rest,
+  });
+}
+
+export async function deleteOAuthCredentials(providerId: string): Promise<void> {
+  await db.oauthCredentials.delete(providerId);
+}
+
+export async function getAllOAuthCredentials(): Promise<OAuthCredentialRecord[]> {
+  return db.oauthCredentials.toArray();
 }

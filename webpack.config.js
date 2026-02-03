@@ -5,6 +5,8 @@ const CopyWebpackPlugin = require("copy-webpack-plugin");
 const HtmlWebpackPlugin = require("html-webpack-plugin");
 const webpack = require("webpack");
 const path = require("path");
+const http = require("http");
+const https = require("https");
 
 const urlDev = "https://localhost:3000/";
 const urlProd = "https://www.contoso.com/"; // CHANGE THIS TO YOUR PRODUCTION DEPLOYMENT LOCATION
@@ -12,6 +14,68 @@ const urlProd = "https://www.contoso.com/"; // CHANGE THIS TO YOUR PRODUCTION DE
 async function getHttpsOptions() {
   const httpsOptions = await devCerts.getHttpsServerOptions();
   return { ca: httpsOptions.ca, key: httpsOptions.key, cert: httpsOptions.cert };
+}
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Expose-Headers": "*",
+};
+
+function proxyHandler(req, res) {
+  const requestUrl = req.url || "";
+  const parsed = new URL(requestUrl, "http://localhost");
+  const target = parsed.searchParams.get("url");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
+
+  if (!target) {
+    res.writeHead(400, CORS_HEADERS);
+    res.end("Missing url query parameter.");
+    return;
+  }
+
+  let targetUrl;
+  try {
+    targetUrl = new URL(target);
+  } catch {
+    res.writeHead(400, CORS_HEADERS);
+    res.end("Invalid url.");
+    return;
+  }
+
+  const headers = { ...req.headers };
+  delete headers.host;
+  delete headers.origin;
+  delete headers.referer;
+  if (!headers["accept-encoding"]) {
+    headers["accept-encoding"] = "identity";
+  }
+
+  const client = targetUrl.protocol === "https:" ? https : http;
+  const proxyReq = client.request(
+    targetUrl,
+    {
+      method: req.method,
+      headers,
+    },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode || 500, { ...proxyRes.headers, ...CORS_HEADERS });
+      proxyRes.pipe(res);
+    },
+  );
+
+  proxyReq.on("error", (err) => {
+    res.writeHead(502, CORS_HEADERS);
+    res.end(`Proxy error: ${err.message}`);
+  });
+
+  req.pipe(proxyReq);
 }
 
 module.exports = async (env, options) => {
@@ -154,7 +218,6 @@ module.exports = async (env, options) => {
         chunks: ["polyfill", "commands"],
       }),
       new webpack.ProvidePlugin({
-        Promise: ["es6-promise", "Promise"],
         Buffer: ["buffer", "Buffer"],
       }),
       new webpack.DefinePlugin({
@@ -167,6 +230,12 @@ module.exports = async (env, options) => {
       hot: true,
       headers: {
         "Access-Control-Allow-Origin": "*",
+      },
+      setupMiddlewares: (middlewares, devServer) => {
+        if (devServer?.app) {
+          devServer.app.use("/proxy", proxyHandler);
+        }
+        return middlewares;
       },
       server: {
         type: "https",

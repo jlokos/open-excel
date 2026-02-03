@@ -1,9 +1,12 @@
-export type { ChatSession } from "./db";
+export type { ChatSession, OAuthCredentialRecord } from "./db";
 export {
   createSession,
   db,
+  deleteOAuthCredentials,
   deleteSession,
   deleteSkill,
+  getAllOAuthCredentials,
+  getOAuthCredentials,
   getOrCreateCurrentSession,
   getOrCreateWorkbookId,
   getSession,
@@ -14,6 +17,7 @@ export {
   listSkillFiles,
   listSkills,
   renameSession,
+  saveOAuthCredentials,
   saveSession,
   saveSkill,
   upsertSkillPackage,

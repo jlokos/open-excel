@@ -39,6 +39,23 @@ export function ChatInput() {
   return (
     <div className="border-t border-(--chat-border) p-3 bg-(--chat-bg)" style={{ fontFamily: "var(--chat-font-mono)" }}>
       {state.error && <div className="text-(--chat-error) text-xs mb-2 px-1">{state.error}</div>}
+      {state.error && state.debug.requestId && (
+        <details className="text-[11px] text-(--chat-text-secondary) mb-2 px-1">
+          <summary className="cursor-pointer select-none">Debug details</summary>
+          <div className="mt-2 space-y-2">
+            <div>Request ID: {state.debug.requestId}</div>
+            {state.debug.provider && <div>Provider: {state.debug.provider}</div>}
+            {state.debug.model && <div>Model: {state.debug.model}</div>}
+            {state.debug.baseUrl && <div>Base URL: {state.debug.baseUrl}</div>}
+            {state.debug.payloadSize !== undefined && <div>Payload size: {state.debug.payloadSize} chars</div>}
+            {state.debug.payloadPreview && (
+              <pre className="whitespace-pre-wrap bg-(--chat-bg-secondary) border border-(--chat-border) p-2 text-[10px] max-h-48 overflow-y-auto">
+                {state.debug.payloadPreview}
+              </pre>
+            )}
+          </div>
+        </details>
+      )}
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaRef}
