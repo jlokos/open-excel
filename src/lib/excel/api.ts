@@ -474,28 +474,96 @@ export async function setCellRange(
   } = {},
 ): Promise<SetCellRangeResult> {
   const { copyToRange, resizeWidth, resizeHeight, allowOverwrite } = options;
+  const rowCount = cells.length;
+  const colCount = rowCount > 0 ? cells[0].length : 0;
 
-  return Excel.run(async (context) => {
+  const values: unknown[][] = [];
+  const formulas: (string | null)[][] = [];
+  let hasFormulas = false;
+  let hasDecorations = false;
+  let totalCells = 0;
+
+  for (let r = 0; r < cells.length; r++) {
+    values[r] = [];
+    formulas[r] = [];
+    for (let c = 0; c < cells[r].length; c++) {
+      const cell = cells[r][c];
+      totalCells += 1;
+      if (cell.formula) {
+        formulas[r][c] = cell.formula;
+        values[r][c] = null;
+        hasFormulas = true;
+      } else {
+        values[r][c] = cell.value ?? null;
+        formulas[r][c] = null;
+      }
+      if (cell.cellStyles || cell.borderStyles || cell.note) {
+        hasDecorations = true;
+      }
+    }
+  }
+
+  const { startRow, startCol } = await Excel.run(async (context) => {
     const sheet = await getWorksheetById(context, sheetId);
     if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
 
     const range = sheet.getRange(rangeAddr);
-    range.load("rowCount,columnCount,values,formulas,address");
+    range.load("rowCount,columnCount,address");
+    const usedRange = !allowOverwrite ? sheet.getUsedRangeOrNullObject() : null;
+    if (usedRange) {
+      usedRange.load("address,rowCount,columnCount");
+    }
     await context.sync();
 
-    if (!allowOverwrite) {
-      const nonEmptyCells: string[] = [];
-      const { startCol, startRow } = parseRangeAddress(range.address);
+    if (range.rowCount !== rowCount || range.columnCount !== colCount) {
+      throw new Error(
+        `Range ${rangeAddr} size ${range.rowCount}x${range.columnCount} does not match cells ${rowCount}x${colCount}.`,
+      );
+    }
 
-      for (let r = 0; r < range.rowCount; r++) {
-        for (let c = 0; c < range.columnCount; c++) {
-          const value = range.values[r][c];
-          const formula = range.formulas[r][c];
+    if (!allowOverwrite) {
+      const rangeStart = parseRangeAddress(range.address);
+
+      if (!usedRange || usedRange.isNullObject || usedRange.rowCount === 0 || usedRange.columnCount === 0) {
+        return rangeStart;
+      }
+
+      const usedStart = parseRangeAddress(usedRange.address);
+      const rangeEndRow = rangeStart.startRow + range.rowCount - 1;
+      const rangeEndCol = rangeStart.startCol + range.columnCount - 1;
+      const usedEndRow = usedStart.startRow + usedRange.rowCount - 1;
+      const usedEndCol = usedStart.startCol + usedRange.columnCount - 1;
+
+      const intersectStartRow = Math.max(rangeStart.startRow, usedStart.startRow);
+      const intersectStartCol = Math.max(rangeStart.startCol, usedStart.startCol);
+      const intersectEndRow = Math.min(rangeEndRow, usedEndRow);
+      const intersectEndCol = Math.min(rangeEndCol, usedEndCol);
+
+      if (intersectStartRow > intersectEndRow || intersectStartCol > intersectEndCol) {
+        return rangeStart;
+      }
+
+      const intersectRowCount = intersectEndRow - intersectStartRow + 1;
+      const intersectColCount = intersectEndCol - intersectStartCol + 1;
+      const intersectRange = sheet.getRangeByIndexes(
+        intersectStartRow,
+        intersectStartCol,
+        intersectRowCount,
+        intersectColCount,
+      );
+      intersectRange.load("values,formulas");
+      await context.sync();
+
+      const nonEmptyCells: string[] = [];
+      for (let r = 0; r < intersectRowCount; r++) {
+        for (let c = 0; c < intersectColCount; c++) {
+          const value = intersectRange.values[r][c];
+          const formula = intersectRange.formulas[r][c];
           const hasValue = value !== null && value !== "" && value !== undefined;
           const hasFormula = typeof formula === "string" && formula.startsWith("=");
 
           if (hasValue || hasFormula) {
-            nonEmptyCells.push(cellAddress(startRow + r, startCol + c));
+            nonEmptyCells.push(cellAddress(intersectStartRow + r, intersectStartCol + c));
           }
         }
       }
@@ -508,140 +576,286 @@ export async function setCellRange(
             `To proceed with overwriting existing data, retry with allow_overwrite set to true.`,
         );
       }
+
+      return rangeStart;
     }
 
-    const values: unknown[][] = [];
-    const formulas: (string | null)[][] = [];
-    let hasFormulas = false;
+    return parseRangeAddress(range.address);
+  });
 
-    for (let r = 0; r < cells.length; r++) {
-      values[r] = [];
-      formulas[r] = [];
-      for (let c = 0; c < cells[r].length; c++) {
-        const cell = cells[r][c];
-        if (cell.formula) {
-          formulas[r][c] = cell.formula;
-          values[r][c] = null;
-          hasFormulas = true;
+  const shouldChunkWrites = totalCells >= 2000;
+  if (shouldChunkWrites) {
+    const chunkSize = 200;
+    for (let r = 0; r < rowCount; r += chunkSize) {
+      const chunkRowCount = Math.min(chunkSize, rowCount - r);
+      await Excel.run(async (context) => {
+        const sheet = await getWorksheetById(context, sheetId);
+        if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
+
+        const chunkRange = sheet.getRangeByIndexes(startRow + r, startCol, chunkRowCount, colCount);
+        if (hasFormulas) {
+          const chunkFormulas = formulas
+            .slice(r, r + chunkRowCount)
+            .map((row, idx) => row.map((f, c) => f ?? values[r + idx][c]));
+          chunkRange.formulas = chunkFormulas;
         } else {
-          values[r][c] = cell.value ?? null;
-          formulas[r][c] = null;
+          chunkRange.values = values.slice(r, r + chunkRowCount);
         }
+
+        await context.sync();
+      });
+      if (r + chunkSize < rowCount) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
+  } else {
+    await Excel.run(async (context) => {
+      const sheet = await getWorksheetById(context, sheetId);
+      if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
 
-    if (hasFormulas) {
-      range.formulas = formulas.map((row, r) => row.map((f, c) => f ?? values[r][c]));
-    } else {
-      range.values = values;
-    }
+      const range = sheet.getRangeByIndexes(startRow, startCol, rowCount, colCount);
+      if (hasFormulas) {
+        range.formulas = formulas.map((row, r) => row.map((f, c) => f ?? values[r][c]));
+      } else {
+        range.values = values;
+      }
 
-    for (let r = 0; r < cells.length; r++) {
-      for (let c = 0; c < cells[r].length; c++) {
-        const cell = cells[r][c];
-        if (!cell.cellStyles && !cell.borderStyles && !cell.note) continue;
+      const shouldFlushValuesEarly =
+        hasDecorations ||
+        copyToRange !== undefined ||
+        resizeWidth !== undefined ||
+        resizeHeight !== undefined ||
+        totalCells >= 100;
+      if (shouldFlushValuesEarly) {
+        await context.sync();
+      }
 
-        const cellRange = range.getCell(r, c);
+      if (hasDecorations) {
+        for (let r = 0; r < cells.length; r++) {
+          for (let c = 0; c < cells[r].length; c++) {
+            const cell = cells[r][c];
+            if (!cell.cellStyles && !cell.borderStyles && !cell.note) continue;
 
-        if (cell.cellStyles) {
-          const s = cell.cellStyles;
-          if (s.fontWeight === "bold") cellRange.format.font.bold = true;
-          if (s.fontStyle === "italic") cellRange.format.font.italic = true;
-          if (s.fontLine === "underline") cellRange.format.font.underline = "Single";
-          if (s.fontLine === "line-through") cellRange.format.font.strikethrough = true;
-          if (s.fontSize) cellRange.format.font.size = s.fontSize;
-          if (s.fontFamily) cellRange.format.font.name = s.fontFamily;
-          if (s.fontColor) cellRange.format.font.color = s.fontColor;
-          if (s.backgroundColor) cellRange.format.fill.color = s.backgroundColor;
-          if (s.horizontalAlignment) {
-            cellRange.format.horizontalAlignment = s.horizontalAlignment as Excel.HorizontalAlignment;
+            const cellRange = range.getCell(r, c);
+
+            if (cell.cellStyles) {
+              const s = cell.cellStyles;
+              if (s.fontWeight === "bold") cellRange.format.font.bold = true;
+              if (s.fontStyle === "italic") cellRange.format.font.italic = true;
+              if (s.fontLine === "underline") cellRange.format.font.underline = "Single";
+              if (s.fontLine === "line-through") cellRange.format.font.strikethrough = true;
+              if (s.fontSize) cellRange.format.font.size = s.fontSize;
+              if (s.fontFamily) cellRange.format.font.name = s.fontFamily;
+              if (s.fontColor) cellRange.format.font.color = s.fontColor;
+              if (s.backgroundColor) cellRange.format.fill.color = s.backgroundColor;
+              if (s.horizontalAlignment) {
+                cellRange.format.horizontalAlignment = s.horizontalAlignment as Excel.HorizontalAlignment;
+              }
+              if (s.numberFormat) cellRange.numberFormat = [[s.numberFormat]];
+            }
+
+            if (cell.borderStyles) {
+              const b = cell.borderStyles;
+              const sideMap: { key: keyof typeof b; index: Excel.BorderIndex }[] = [
+                { key: "top", index: Excel.BorderIndex.edgeTop },
+                { key: "bottom", index: Excel.BorderIndex.edgeBottom },
+                { key: "left", index: Excel.BorderIndex.edgeLeft },
+                { key: "right", index: Excel.BorderIndex.edgeRight },
+              ];
+              for (const { key, index } of sideMap) {
+                const side = b[key];
+                if (!side) continue;
+                const border = cellRange.format.borders.getItem(index);
+                if (side.style) {
+                  const styleMap: Record<string, Excel.BorderLineStyle> = {
+                    solid: Excel.BorderLineStyle.continuous,
+                    dashed: Excel.BorderLineStyle.dash,
+                    dotted: Excel.BorderLineStyle.dot,
+                    double: Excel.BorderLineStyle.double,
+                  };
+                  border.style = styleMap[side.style] ?? Excel.BorderLineStyle.continuous;
+                }
+                if (side.weight) {
+                  const weightMap: Record<string, Excel.BorderWeight> = {
+                    thin: Excel.BorderWeight.thin,
+                    medium: Excel.BorderWeight.medium,
+                    thick: Excel.BorderWeight.thick,
+                  };
+                  border.weight = weightMap[side.weight] ?? Excel.BorderWeight.thin;
+                }
+                if (side.color) {
+                  border.color = side.color;
+                }
+              }
+            }
+
+            if (cell.note) {
+              const noteTarget = cellRange as unknown as { note?: string; addNote?: (note: string) => void };
+              if (typeof noteTarget.addNote === "function") {
+                noteTarget.addNote(cell.note);
+              } else if ("note" in noteTarget) {
+                noteTarget.note = cell.note;
+              }
+            }
           }
-          if (s.numberFormat) cellRange.numberFormat = [[s.numberFormat]];
-        }
-
-        if (cell.borderStyles) {
-          const b = cell.borderStyles;
-          const sideMap: { key: keyof typeof b; index: Excel.BorderIndex }[] = [
-            { key: "top", index: Excel.BorderIndex.edgeTop },
-            { key: "bottom", index: Excel.BorderIndex.edgeBottom },
-            { key: "left", index: Excel.BorderIndex.edgeLeft },
-            { key: "right", index: Excel.BorderIndex.edgeRight },
-          ];
-          for (const { key, index } of sideMap) {
-            const side = b[key];
-            if (!side) continue;
-            const border = cellRange.format.borders.getItem(index);
-            if (side.style) {
-              const styleMap: Record<string, Excel.BorderLineStyle> = {
-                solid: Excel.BorderLineStyle.continuous,
-                dashed: Excel.BorderLineStyle.dash,
-                dotted: Excel.BorderLineStyle.dot,
-                double: Excel.BorderLineStyle.double,
-              };
-              border.style = styleMap[side.style] ?? Excel.BorderLineStyle.continuous;
-            }
-            if (side.weight) {
-              const weightMap: Record<string, Excel.BorderWeight> = {
-                thin: Excel.BorderWeight.thin,
-                medium: Excel.BorderWeight.medium,
-                thick: Excel.BorderWeight.thick,
-              };
-              border.weight = weightMap[side.weight] ?? Excel.BorderWeight.thin;
-            }
-            if (side.color) {
-              border.color = side.color;
-            }
-          }
-        }
-
-        if (cell.note) {
-          cellRange.load("address");
-          await context.sync();
-          const cellAddr = cellRange.address.split("!")[1] || cellRange.address;
-          sheet.notes.add(cellAddr, cell.note);
         }
       }
-    }
 
-    await context.sync();
+      await context.sync();
+
+      if (copyToRange) {
+        const destRange = sheet.getRange(copyToRange);
+        destRange.copyFrom(range, Excel.RangeCopyType.all);
+        await context.sync();
+      }
+
+      if (resizeWidth) {
+        const cols = range.getEntireColumn();
+        cols.format.columnWidth = resizeWidth.value;
+      }
+      if (resizeHeight) {
+        const rows = range.getEntireRow();
+        rows.format.rowHeight = resizeHeight.value;
+      }
+
+      if (resizeWidth || resizeHeight) {
+        await context.sync();
+      }
+    });
+  }
+
+  if (shouldChunkWrites) {
+    if (hasDecorations) {
+      await Excel.run(async (context) => {
+        const sheet = await getWorksheetById(context, sheetId);
+        if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
+
+        const range = sheet.getRangeByIndexes(startRow, startCol, rowCount, colCount);
+        for (let r = 0; r < cells.length; r++) {
+          for (let c = 0; c < cells[r].length; c++) {
+            const cell = cells[r][c];
+            if (!cell.cellStyles && !cell.borderStyles && !cell.note) continue;
+
+            const cellRange = range.getCell(r, c);
+
+            if (cell.cellStyles) {
+              const s = cell.cellStyles;
+              if (s.fontWeight === "bold") cellRange.format.font.bold = true;
+              if (s.fontStyle === "italic") cellRange.format.font.italic = true;
+              if (s.fontLine === "underline") cellRange.format.font.underline = "Single";
+              if (s.fontLine === "line-through") cellRange.format.font.strikethrough = true;
+              if (s.fontSize) cellRange.format.font.size = s.fontSize;
+              if (s.fontFamily) cellRange.format.font.name = s.fontFamily;
+              if (s.fontColor) cellRange.format.font.color = s.fontColor;
+              if (s.backgroundColor) cellRange.format.fill.color = s.backgroundColor;
+              if (s.horizontalAlignment) {
+                cellRange.format.horizontalAlignment = s.horizontalAlignment as Excel.HorizontalAlignment;
+              }
+              if (s.numberFormat) cellRange.numberFormat = [[s.numberFormat]];
+            }
+
+            if (cell.borderStyles) {
+              const b = cell.borderStyles;
+              const sideMap: { key: keyof typeof b; index: Excel.BorderIndex }[] = [
+                { key: "top", index: Excel.BorderIndex.edgeTop },
+                { key: "bottom", index: Excel.BorderIndex.edgeBottom },
+                { key: "left", index: Excel.BorderIndex.edgeLeft },
+                { key: "right", index: Excel.BorderIndex.edgeRight },
+              ];
+              for (const { key, index } of sideMap) {
+                const side = b[key];
+                if (!side) continue;
+                const border = cellRange.format.borders.getItem(index);
+                if (side.style) {
+                  const styleMap: Record<string, Excel.BorderLineStyle> = {
+                    solid: Excel.BorderLineStyle.continuous,
+                    dashed: Excel.BorderLineStyle.dash,
+                    dotted: Excel.BorderLineStyle.dot,
+                    double: Excel.BorderLineStyle.double,
+                  };
+                  border.style = styleMap[side.style] ?? Excel.BorderLineStyle.continuous;
+                }
+                if (side.weight) {
+                  const weightMap: Record<string, Excel.BorderWeight> = {
+                    thin: Excel.BorderWeight.thin,
+                    medium: Excel.BorderWeight.medium,
+                    thick: Excel.BorderWeight.thick,
+                  };
+                  border.weight = weightMap[side.weight] ?? Excel.BorderWeight.thin;
+                }
+                if (side.color) {
+                  border.color = side.color;
+                }
+              }
+            }
+
+            if (cell.note) {
+              const noteTarget = cellRange as unknown as { note?: string; addNote?: (note: string) => void };
+              if (typeof noteTarget.addNote === "function") {
+                noteTarget.addNote(cell.note);
+              } else if ("note" in noteTarget) {
+                noteTarget.note = cell.note;
+              }
+            }
+          }
+        }
+        await context.sync();
+      });
+    }
 
     if (copyToRange) {
-      const destRange = sheet.getRange(copyToRange);
-      destRange.copyFrom(range, Excel.RangeCopyType.all);
+      await Excel.run(async (context) => {
+        const sheet = await getWorksheetById(context, sheetId);
+        if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
+        const range = sheet.getRangeByIndexes(startRow, startCol, rowCount, colCount);
+        const destRange = sheet.getRange(copyToRange);
+        destRange.copyFrom(range, Excel.RangeCopyType.all);
+        await context.sync();
+      });
+    }
+
+    if (resizeWidth || resizeHeight) {
+      await Excel.run(async (context) => {
+        const sheet = await getWorksheetById(context, sheetId);
+        if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
+        const range = sheet.getRangeByIndexes(startRow, startCol, rowCount, colCount);
+        if (resizeWidth) {
+          const cols = range.getEntireColumn();
+          cols.format.columnWidth = resizeWidth.value;
+        }
+        if (resizeHeight) {
+          const rows = range.getEntireRow();
+          rows.format.rowHeight = resizeHeight.value;
+        }
+        await context.sync();
+      });
+    }
+  }
+
+  const formulaResults: Record<string, unknown> = {};
+  if (hasFormulas) {
+    const valuesResult = await Excel.run(async (context) => {
+      const sheet = await getWorksheetById(context, sheetId);
+      if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
+      const range = sheet.getRangeByIndexes(startRow, startCol, rowCount, colCount);
+      range.load("values");
       await context.sync();
-    }
-
-    if (resizeWidth) {
-      const cols = range.getEntireColumn();
-      cols.format.columnWidth = resizeWidth.value;
-    }
-    if (resizeHeight) {
-      const rows = range.getEntireRow();
-      rows.format.rowHeight = resizeHeight.value;
-    }
-
-    await context.sync();
-
-    const formulaResults: Record<string, unknown> = {};
-    if (hasFormulas) {
-      range.load("values,address");
-      await context.sync();
-      const { startCol, startRow } = parseRangeAddress(range.address);
-      for (let r = 0; r < range.values.length; r++) {
-        for (let c = 0; c < range.values[r].length; c++) {
-          if (formulas[r]?.[c]) {
-            formulaResults[cellAddress(startRow + r, startCol + c)] = range.values[r][c];
-          }
+      return range.values as unknown[][];
+    });
+    for (let r = 0; r < valuesResult.length; r++) {
+      for (let c = 0; c < valuesResult[r].length; c++) {
+        if (formulas[r]?.[c]) {
+          formulaResults[cellAddress(startRow + r, startCol + c)] = valuesResult[r][c];
         }
       }
     }
+  }
 
-    return {
-      success: true,
-      cellsWritten: cells.flat().length,
-      ...(Object.keys(formulaResults).length > 0 && { formulaResults }),
-    };
-  });
+  return {
+    success: true,
+    cellsWritten: totalCells,
+    ...(Object.keys(formulaResults).length > 0 && { formulaResults }),
+  };
 }
 
 export interface ClearCellRangeResult {
