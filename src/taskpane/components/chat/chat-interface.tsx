@@ -51,8 +51,8 @@ function StatsBar() {
 
   return (
     <div
-      className="flex items-center justify-between px-3 py-1.5 text-[10px] border-t border-(--chat-border) bg-(--chat-bg-secondary) text-(--chat-text-muted)"
-      style={{ fontFamily: "var(--chat-font-mono)" }}
+      className="flex items-center justify-between px-4 py-2 text-[11px] border-t border-(--chat-border) bg-(--chat-bg-secondary) text-(--chat-text-muted)"
+      style={{ fontFamily: "var(--chat-font-sans)" }}
     >
       <div className="flex items-center gap-3">
         <span title="Input tokens">↑{formatTokens(sessionStats.inputTokens)}</span>
@@ -85,15 +85,15 @@ function TabButton({ active, onClick, children }: { active: boolean; onClick: ()
       type="button"
       onClick={onClick}
       className={`
-        flex items-center gap-1.5 px-3 py-2 text-xs uppercase tracking-wider
-        border-b-2 transition-colors
+        flex items-center gap-2 px-3 py-1.5 text-sm font-medium
+        rounded-full border transition-colors
         ${
           active
-            ? "border-(--chat-accent) text-(--chat-text-primary)"
-            : "border-transparent text-(--chat-text-muted) hover:text-(--chat-text-secondary)"
+            ? "border-(--chat-accent) text-(--chat-text-primary) bg-(--chat-bg-secondary) shadow-[var(--chat-shadow-soft)]"
+            : "border-(--chat-border) text-(--chat-text-secondary) hover:bg-(--chat-bg-secondary)"
         }
       `}
-      style={{ fontFamily: "var(--chat-font-mono)" }}
+      style={{ fontFamily: "var(--chat-font-sans)" }}
     >
       {children}
     </button>
@@ -139,10 +139,11 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
         type="button"
         onClick={() => setOpen(!open)}
         className={`
-          flex items-center gap-1 px-3 py-2 text-xs uppercase tracking-wider
-          border-b-2 border-(--chat-accent) text-(--chat-text-primary) transition-colors
+          flex items-center gap-2 px-3 py-1.5 text-sm font-medium
+          rounded-full border border-(--chat-accent) bg-(--chat-bg-secondary) text-(--chat-text-primary)
+          shadow-[var(--chat-shadow-soft)] transition-colors
         `}
-        style={{ fontFamily: "var(--chat-font-mono)" }}
+        style={{ fontFamily: "var(--chat-font-sans)" }}
       >
         <MessageSquare size={12} />
         <span className="max-w-[100px] truncate">{truncatedName}</span>
@@ -151,17 +152,17 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
 
       {open && (
         <div
-          className="absolute top-full left-0 mt-1 w-56 bg-(--chat-bg) border border-(--chat-border) rounded shadow-lg z-50 overflow-hidden"
-          style={{ fontFamily: "var(--chat-font-mono)" }}
+          className="absolute top-full left-0 mt-2 w-60 bg-(--chat-bg-secondary) border border-(--chat-border) rounded-xl shadow-[var(--chat-shadow)] z-50 overflow-hidden"
+          style={{ fontFamily: "var(--chat-font-sans)" }}
         >
           <button
             type="button"
             onClick={handleNewSession}
             disabled={isStreaming}
-            className={`w-full flex items-center gap-2 px-3 py-2 text-xs transition-colors border-b border-(--chat-border) ${
+            className={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors border-b border-(--chat-border) ${
               isStreaming
                 ? "text-(--chat-text-muted) cursor-not-allowed"
-                : "text-(--chat-accent) hover:bg-(--chat-bg-secondary)"
+                : "text-(--chat-accent) hover:bg-(--chat-bg-tertiary)"
             }`}
           >
             <Plus size={14} />
@@ -178,9 +179,9 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
                   key={session.id}
                   disabled={isDisabled}
                   className={`
-                    flex items-center justify-between px-3 py-2 text-xs transition-colors w-full text-left
-                    ${isCurrent ? "bg-(--chat-bg-secondary)" : ""}
-                    ${isDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:bg-(--chat-bg-secondary)"}
+                    flex items-center justify-between px-3 py-2 text-sm transition-colors w-full text-left
+                    ${isCurrent ? "bg-(--chat-bg-tertiary)" : ""}
+                    ${isDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:bg-(--chat-bg-tertiary)"}
                   `}
                   onClick={() => handleSwitch(session.id)}
                 >
@@ -207,10 +208,10 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
                 await deleteCurrentSession();
                 setOpen(false);
               }}
-              className={`w-full flex items-center gap-2 px-3 py-2 text-xs transition-colors border-t border-(--chat-border) ${
+              className={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors border-t border-(--chat-border) ${
                 isStreaming
                   ? "text-(--chat-text-muted) cursor-not-allowed"
-                  : "text-(--chat-error) hover:bg-(--chat-bg-secondary)"
+                  : "text-(--chat-error) hover:bg-(--chat-bg-tertiary)"
               }`}
             >
               <Trash2 size={14} />
@@ -238,8 +239,8 @@ function ChatHeader({
 
   return (
     <div className="border-b border-(--chat-border) bg-(--chat-bg)">
-      <div className="flex items-center justify-between px-2">
-        <div className="flex">
+      <div className="flex items-center justify-between px-4 py-3">
+        <div className="flex items-center gap-2">
           {activeTab === "chat" ? (
             <SessionDropdown onSelect={() => onTabChange("chat")} />
           ) : (
@@ -257,11 +258,11 @@ function ChatHeader({
             Skills
           </TabButton>
         </div>
-        <div className="flex items-center">
+        <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={onThemeToggle}
-            className="p-1.5 text-(--chat-text-muted) hover:text-(--chat-text-primary) transition-colors"
+            className="p-2 rounded-full border border-(--chat-border) bg-(--chat-bg-secondary) text-(--chat-text-secondary) hover:text-(--chat-text-primary) hover:border-(--chat-border-active) transition-colors"
             title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
           >
             {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
@@ -270,7 +271,7 @@ function ChatHeader({
             <button
               type="button"
               onClick={clearMessages}
-              className="p-1.5 text-(--chat-text-muted) hover:text-(--chat-error) transition-colors"
+              className="p-2 rounded-full border border-(--chat-border) bg-(--chat-bg-secondary) text-(--chat-text-secondary) hover:text-(--chat-error) hover:border-(--chat-error) transition-colors"
               title="Clear messages"
             >
               <Trash2 size={14} />
@@ -287,7 +288,7 @@ function ChatContent() {
   const { theme, toggle } = useTheme();
 
   return (
-    <div className="flex flex-col h-full bg-(--chat-bg)" style={{ fontFamily: "var(--chat-font-mono)" }}>
+    <div className="flex flex-col h-full bg-(--chat-bg)" style={{ fontFamily: "var(--chat-font-sans)" }}>
       <ChatHeader activeTab={activeTab} onTabChange={setActiveTab} theme={theme} onThemeToggle={toggle} />
       {activeTab === "chat" ? (
         <>

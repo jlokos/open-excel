@@ -188,11 +188,11 @@ export function SettingsPanel() {
 
   const inputStyle = {
     borderRadius: "var(--chat-radius)",
-    fontFamily: "var(--chat-font-mono)",
+    fontFamily: "var(--chat-font-sans)",
   };
 
   return (
-    <div className="flex-1 overflow-y-auto p-4 space-y-6" style={{ fontFamily: "var(--chat-font-mono)" }}>
+    <div className="flex-1 overflow-y-auto p-5 space-y-6" style={{ fontFamily: "var(--chat-font-sans)" }}>
       <div>
         <div className="text-[10px] uppercase tracking-widest text-(--chat-text-muted) mb-4">api configuration</div>
 

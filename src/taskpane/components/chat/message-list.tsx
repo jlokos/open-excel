@@ -1,5 +1,5 @@
 import { code } from "@streamdown/code";
-import { Brain, CheckCircle2, ChevronDown, ChevronRight, Loader2, Wrench, XCircle } from "lucide-react";
+import { ArrowRight, Brain, CheckCircle2, ChevronDown, ChevronRight, Loader2, Wrench, XCircle } from "lucide-react";
 import type { AnchorHTMLAttributes } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Streamdown } from "streamdown";
@@ -10,11 +10,11 @@ function ThinkingBlock({ thinking, isStreaming }: { thinking: string; isStreamin
   const [isExpanded, setIsExpanded] = useState(false);
 
   return (
-    <div className="mb-2 border border-(--chat-border) bg-(--chat-bg) rounded-sm overflow-hidden">
+    <div className="mb-3 border border-(--chat-border) bg-(--chat-bg-secondary) rounded-lg overflow-hidden shadow-[var(--chat-shadow-soft)]">
       <button
         type="button"
         onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full flex items-center gap-1.5 px-2 py-1 text-[10px] uppercase tracking-wider text-(--chat-accent) hover:bg-(--chat-bg-secondary) transition-colors"
+        className="w-full flex items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-(--chat-accent) hover:bg-(--chat-bg-tertiary) transition-colors"
       >
         {isExpanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
         <Brain size={10} />
@@ -22,7 +22,7 @@ function ThinkingBlock({ thinking, isStreaming }: { thinking: string; isStreamin
         {isStreaming && <span className="animate-pulse ml-1">...</span>}
       </button>
       {isExpanded && (
-        <div className="px-2 py-1.5 text-xs text-(--chat-text-muted) whitespace-pre-wrap break-words border-t border-(--chat-border) max-h-20 overflow-y-auto">
+        <div className="px-3 py-2 text-xs text-(--chat-text-muted) whitespace-pre-wrap break-words border-t border-(--chat-border) max-h-24 overflow-y-auto">
           {thinking}
         </div>
       )}
@@ -45,11 +45,11 @@ function ToolCallBlock({ part }: { part: ToolCallPart }) {
   }[part.status];
 
   return (
-    <div className="mt-3 mb-2 border border-(--chat-border) bg-(--chat-bg) rounded-sm overflow-hidden">
+    <div className="mt-3 mb-3 border border-(--chat-border) bg-(--chat-bg-secondary) rounded-lg overflow-hidden shadow-[var(--chat-shadow-soft)]">
       <button
         type="button"
         onClick={() => setIsExpanded(!isExpanded)}
-        className={`w-full flex items-center gap-1.5 px-2 py-1 text-[10px] tracking-wider text-(--chat-text-secondary) hover:bg-(--chat-bg-secondary) transition-colors ${explanation ? "normal-case" : "uppercase"}`}
+        className={`w-full flex items-center gap-2 px-3 py-2 text-[11px] font-medium text-(--chat-text-secondary) hover:bg-(--chat-bg-tertiary) transition-colors ${explanation ? "normal-case" : "uppercase"}`}
       >
         {isExpanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
         <Wrench size={10} />
@@ -58,14 +58,14 @@ function ToolCallBlock({ part }: { part: ToolCallPart }) {
       </button>
       {isExpanded && (
         <div className="border-t border-(--chat-border)">
-          <div className="px-2 py-1.5 text-xs">
+          <div className="px-3 py-2 text-xs">
             <div className="text-(--chat-text-muted) text-[10px] uppercase mb-1">args</div>
             <div className="markdown-content max-h-32 overflow-y-auto [&_[data-streamdown=code-block]]:my-0 [&_[data-streamdown=code-block]]:border-0">
               <Streamdown plugins={{ code }}>{`\`\`\`json\n${JSON.stringify(part.args, null, 2)}\n\`\`\``}</Streamdown>
             </div>
           </div>
           {part.result && (
-            <div className="px-2 py-1.5 text-xs border-t border-(--chat-border)">
+            <div className="px-3 py-2 text-xs border-t border-(--chat-border)">
               <div className="text-(--chat-text-muted) text-[10px] uppercase mb-1">
                 {part.status === "error" ? "error" : "result"}
               </div>
@@ -95,11 +95,11 @@ function ImageBlock({ part }: { part: ImagePart }) {
 function LoadingIndicator() {
   return (
     <div
-      className="flex items-center gap-2 text-(--chat-text-muted) text-sm"
-      style={{ fontFamily: "var(--chat-font-mono)" }}
+      className="flex items-center gap-2 text-(--chat-accent) text-sm"
+      style={{ fontFamily: "var(--chat-font-sans)" }}
     >
-      <Loader2 size={14} className="animate-spin" />
-      <span>thinking...</span>
+      <span className="h-2 w-2 rounded-full bg-(--chat-accent) animate-pulse" />
+      <span>Reasoning...</span>
     </div>
   );
 }
@@ -179,8 +179,8 @@ function renderParts(parts: MessagePart[], isStreaming: boolean, messageId: stri
 function UserBubble({ message }: { message: ChatMessage }) {
   return (
     <div
-      className="ml-8 px-3 py-2 text-sm leading-relaxed bg-(--chat-user-bg) border border-(--chat-border)"
-      style={{ borderRadius: "var(--chat-radius)", fontFamily: "var(--chat-font-mono)" }}
+      className="ml-6 max-w-[85%] px-4 py-3 text-sm leading-relaxed bg-(--chat-user-bg) border border-(--chat-border) shadow-[var(--chat-shadow-soft)]"
+      style={{ borderRadius: "var(--chat-radius)", fontFamily: "var(--chat-font-sans)" }}
     >
       {renderParts(message.parts, false, message.id)}
     </div>
@@ -202,7 +202,7 @@ function AssistantBubble({ messages, isStreaming }: { messages: ChatMessage[]; i
   }
 
   return (
-    <div className="text-sm leading-relaxed" style={{ fontFamily: "var(--chat-font-mono)" }}>
+    <div className="text-sm leading-relaxed max-w-[90%]" style={{ fontFamily: "var(--chat-font-sans)" }}>
       {allParts.map(({ part, messageId, isLast }, idx) => {
         const key = part.type === "toolCall" ? part.id : `${messageId}-${part.type}-${idx}`;
         if (part.type === "thinking") {
@@ -249,7 +249,7 @@ function groupMessages(messages: ChatMessage[]): MessageGroup[] {
 }
 
 export function MessageList() {
-  const { state } = useChat();
+  const { state, sendMessage } = useChat();
   const containerRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
 
@@ -275,14 +275,34 @@ export function MessageList() {
   }, [state.messages, state.isStreaming]);
 
   if (state.messages.length === 0) {
+    const suggestions = ["Build a 3-statement model", "Create a debt payoff plan", "Build a family tree"];
+    const canSend = Boolean(state.providerConfig) && !state.isStreaming;
     return (
       <div
-        className="flex-1 flex flex-col items-center justify-center p-6 text-center"
-        style={{ fontFamily: "var(--chat-font-mono)" }}
+        className="flex-1 flex flex-col items-center justify-center p-8 text-center gap-6"
+        style={{ fontFamily: "var(--chat-font-sans)" }}
       >
-        <div className="text-(--chat-text-muted) text-xs uppercase tracking-widest mb-2">no messages</div>
-        <div className="text-(--chat-text-secondary) text-sm max-w-[200px]">
-          Start a conversation to interact with your Excel data
+        <div className="space-y-2">
+          <div className="text-2xl font-semibold tracking-tight text-(--chat-text-primary)">OpenExcel</div>
+          <div className="text-(--chat-text-secondary) text-sm max-w-[260px]">
+            Ask anything about your spreadsheet or start with a template.
+          </div>
+        </div>
+        <div className="w-full max-w-[260px] space-y-2">
+          {suggestions.map((prompt) => (
+            <button
+              key={prompt}
+              type="button"
+              disabled={!canSend}
+              onClick={() => {
+                void sendMessage(prompt);
+              }}
+              className="w-full flex items-center justify-between gap-3 px-4 py-2 rounded-full border border-(--chat-border) bg-(--chat-bg-secondary) text-sm text-(--chat-text-secondary) shadow-[var(--chat-shadow-soft)] transition-colors hover:border-(--chat-accent) hover:text-(--chat-text-primary) disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <span className="text-left">{prompt}</span>
+              <ArrowRight size={14} className="text-(--chat-text-muted)" />
+            </button>
+          ))}
         </div>
       </div>
     );
@@ -297,7 +317,7 @@ export function MessageList() {
   return (
     <div
       ref={containerRef}
-      className="flex-1 overflow-y-auto p-3 space-y-3"
+      className="flex-1 overflow-y-auto p-6 space-y-4"
       style={{
         scrollbarWidth: "thin",
         scrollbarColor: "var(--chat-scrollbar) transparent",

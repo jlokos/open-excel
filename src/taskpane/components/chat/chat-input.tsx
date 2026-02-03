@@ -135,7 +135,10 @@ export function ChatInput() {
   const attachDisabled = !state.providerConfig || !supportsImages || state.isStreaming;
 
   return (
-    <div className="border-t border-(--chat-border) p-3 bg-(--chat-bg)" style={{ fontFamily: "var(--chat-font-mono)" }}>
+    <div
+      className="border-t border-(--chat-border) bg-(--chat-bg) px-5 pb-5 pt-3"
+      style={{ fontFamily: "var(--chat-font-sans)" }}
+    >
       {state.error && <div className="text-(--chat-error) text-xs mb-2 px-1">{state.error}</div>}
       {attachmentError && <div className="text-(--chat-error) text-xs mb-2 px-1">{attachmentError}</div>}
       {state.error && state.debug.requestId && (
@@ -155,120 +158,103 @@ export function ChatInput() {
           </div>
         </details>
       )}
-      {attachments.length > 0 && (
-        <div className="flex flex-wrap gap-2 mb-2 px-1">
-          {attachments.map((attachment) => {
-            const src = `data:${attachment.mimeType};base64,${attachment.data}`;
-            return (
-              <div
-                key={attachment.id}
-                className="relative border border-(--chat-border) bg-(--chat-bg-secondary) p-1"
-                style={{ borderRadius: "var(--chat-radius)" }}
-              >
-                <img
-                  src={src}
-                  alt={attachment.name ?? "attachment"}
-                  className="h-16 w-16 object-cover"
-                  loading="lazy"
-                />
-                <button
-                  type="button"
-                  onClick={() => removeAttachment(attachment.id)}
-                  className="absolute -top-2 -right-2 p-0.5 rounded-full bg-(--chat-bg) border border-(--chat-border) text-(--chat-text-muted) hover:text-(--chat-text-primary)"
-                  aria-label="Remove attachment"
+      <div className="rounded-2xl border-2 border-(--chat-accent) bg-(--chat-input-bg) shadow-[var(--chat-shadow)] p-3">
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-3 px-1">
+            {attachments.map((attachment) => {
+              const src = `data:${attachment.mimeType};base64,${attachment.data}`;
+              return (
+                <div
+                  key={attachment.id}
+                  className="relative border border-(--chat-border) bg-(--chat-bg-secondary) p-1 shadow-[var(--chat-shadow-soft)]"
+                  style={{ borderRadius: "var(--chat-radius)" }}
                 >
-                  <X size={10} />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-      <div className="flex items-end gap-2">
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          multiple
-          className="hidden"
-          onChange={(e) => handleFileChange(e.target.files)}
-        />
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={attachDisabled}
-          title={
-            !state.providerConfig
-              ? "Configure an API provider to attach images"
-              : !supportsImages
-                ? "Selected model does not support images"
-                : "Attach image"
-          }
-          className={`
-            p-2 border border-(--chat-border) bg-(--chat-bg-secondary)
-            text-(--chat-text-secondary)
-            hover:bg-(--chat-bg-tertiary) hover:text-(--chat-text-primary)
-            hover:border-(--chat-border-active)
-            disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-(--chat-bg-secondary)
-            transition-colors
-          `}
-          style={{ borderRadius: "var(--chat-radius)" }}
-        >
-          <ImagePlus size={16} />
-        </button>
-        <textarea
-          ref={textareaRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={state.providerConfig ? "Type a message..." : "Configure API key in settings"}
-          disabled={!state.providerConfig}
-          rows={1}
-          className={`
-            flex-1 resize-none bg-(--chat-input-bg) text-(--chat-text-primary)
-            text-sm px-3 py-2 border border-(--chat-border)
-            placeholder:text-(--chat-text-muted)
-            focus:outline-none focus:border-(--chat-border-active)
-            disabled:opacity-50 disabled:cursor-not-allowed
-          `}
-          style={{
-            borderRadius: "var(--chat-radius)",
-            fontFamily: "var(--chat-font-mono)",
-            minHeight: "36px",
-          }}
-        />
-        {state.isStreaming ? (
-          <button
-            type="button"
-            onClick={abort}
-            className={`
-              p-2 border border-(--chat-error) bg-(--chat-bg-secondary)
-              text-(--chat-error)
-              hover:bg-(--chat-error) hover:text-(--chat-bg)
-              transition-colors
-            `}
-            style={{ borderRadius: "var(--chat-radius)" }}
-          >
-            <Square size={16} />
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={handleSubmit}
-            disabled={!canSend}
-            className={`
-              p-2 border border-(--chat-border) bg-(--chat-bg-secondary)
-              text-(--chat-text-secondary)
-              hover:bg-(--chat-bg-tertiary) hover:text-(--chat-text-primary)
-              hover:border-(--chat-border-active)
-              disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-(--chat-bg-secondary)
-              transition-colors
-            `}
-            style={{ borderRadius: "var(--chat-radius)" }}
-          >
-            <Send size={16} />
-          </button>
+                  <img
+                    src={src}
+                    alt={attachment.name ?? "attachment"}
+                    className="h-16 w-16 object-cover"
+                    loading="lazy"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeAttachment(attachment.id)}
+                    className="absolute -top-2 -right-2 p-0.5 rounded-full bg-(--chat-bg) border border-(--chat-border) text-(--chat-text-muted) hover:text-(--chat-text-primary)"
+                    aria-label="Remove attachment"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
         )}
+        <div className="flex items-start gap-2">
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={state.providerConfig ? "Type a message..." : "Configure API key in settings"}
+            disabled={!state.providerConfig}
+            rows={1}
+            className={`
+              flex-1 resize-none bg-transparent text-(--chat-text-primary)
+              text-sm px-1 py-1
+              placeholder:text-(--chat-text-muted)
+              focus:outline-none
+              disabled:opacity-50 disabled:cursor-not-allowed
+            `}
+            style={{
+              borderRadius: "var(--chat-radius)",
+              fontFamily: "var(--chat-font-sans)",
+              minHeight: "56px",
+            }}
+          />
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => handleFileChange(e.target.files)}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={attachDisabled}
+            title={
+              !state.providerConfig
+                ? "Configure an API provider to attach images"
+                : !supportsImages
+                  ? "Selected model does not support images"
+                  : "Attach image"
+            }
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border border-(--chat-border) bg-(--chat-bg-secondary) text-(--chat-text-secondary) hover:border-(--chat-border-active) hover:text-(--chat-text-primary) disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            <ImagePlus size={16} />
+          </button>
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <div className="text-[11px] text-(--chat-text-muted)">Enter to send • Shift+Enter for newline</div>
+          {state.isStreaming ? (
+            <button
+              type="button"
+              onClick={abort}
+              className="h-9 w-9 inline-flex items-center justify-center rounded-lg bg-(--chat-text-primary) text-(--chat-bg) hover:bg-(--chat-text-secondary) transition-colors"
+            >
+              <Square size={16} />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={!canSend}
+              className="h-9 w-9 inline-flex items-center justify-center rounded-lg bg-(--chat-accent) text-white shadow-[var(--chat-shadow-soft)] hover:bg-(--chat-accent-hover) disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              <Send size={16} />
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

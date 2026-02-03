@@ -665,7 +665,7 @@ export function OAuthLoginDialog({ provider, isOpen, onClose, onSuccess, proxyUr
 
   const inputStyle = {
     borderRadius: "var(--chat-radius)",
-    fontFamily: "var(--chat-font-mono)",
+    fontFamily: "var(--chat-font-sans)",
   };
 
   return (
