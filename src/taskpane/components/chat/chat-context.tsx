@@ -230,7 +230,8 @@ function getModelSupportsImages(config: ProviderConfig | null): boolean {
 
 function buildProxiedUrl(url: string, proxyUrl?: string): string {
   if (!proxyUrl) return url;
-  return `${proxyUrl}/?url=${encodeURIComponent(url)}`;
+  const proxyBase = proxyUrl.replace(/\/+$/, "");
+  return `${proxyBase}/${encodeURIComponent(url)}`;
 }
 
 function normalizeDomain(input: string): string | null {
@@ -265,7 +266,11 @@ function decodeJwt(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
-    const payload = parts[1] ?? "";
+    let payload = parts[1] ?? "";
+    payload = payload.replace(/-/g, "+").replace(/_/g, "/");
+    while (payload.length % 4 !== 0) {
+      payload += "=";
+    }
     return JSON.parse(atob(payload)) as Record<string, unknown>;
   } catch {
     return null;
@@ -410,7 +415,7 @@ async function refreshOpenAICodexToken(
     return {
       access: data.access_token,
       refresh: data.refresh_token,
-      expires: Date.now() + data.expires_in * 1000,
+      expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
       accountId: accountId ?? undefined,
     };
   } catch (err) {
@@ -463,12 +468,12 @@ async function getApiKeyForConfig(
 
   if (refreshed) {
     const updatedCredentials: OAuthCredentialRecord = {
+      ...refreshed,
       id: config.oauthProvider,
       access: refreshed.access,
       refresh: refreshed.refresh,
       expires: refreshed.expires,
       updatedAt: Date.now(),
-      ...refreshed,
     };
     return { apiKey: refreshed.access, updatedCredentials, credentials: updatedCredentials };
   }
@@ -1565,21 +1570,22 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const setSkillEnabled = useCallback(
     async (id: string, enabled: boolean) => {
-      setSkills((prev) =>
-        prev.map((skill) =>
+      setSkills((prev) => {
+        const updatedAt = Date.now();
+        const existing = prev.find((skill) => skill.id === id);
+        if (existing) {
+          void saveSkill({ ...existing, enabled, updatedAt });
+        }
+        return prev.map((skill) =>
           skill.id === id
             ? {
                 ...skill,
                 enabled,
-                updatedAt: Date.now(),
+                updatedAt,
               }
             : skill,
-        ),
-      );
-      const existing = skills.find((skill) => skill.id === id);
-      if (existing) {
-        await saveSkill({ ...existing, enabled, updatedAt: Date.now() });
-      }
+        );
+      });
       if (enabled) {
         const content = await loadSkillContent(id);
         if (content) {
@@ -1593,7 +1599,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         });
       }
     },
-    [loadSkillContent, skills],
+    [loadSkillContent],
   );
 
   const removeSkill = useCallback(async (id: string) => {
@@ -1672,13 +1678,21 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     });
 
     let draft = "";
-    draftAgent.subscribe((event: AgentEvent) => {
+    const draftSubscription = draftAgent.subscribe((event: AgentEvent) => {
       if ((event.type === "message_update" || event.type === "message_end") && event.message.role === "assistant") {
         draft = extractTextFromAssistantMessage(event.message);
       }
     });
 
-    await draftAgent.prompt(buildSkillDraftPrompt(input));
+    try {
+      await draftAgent.prompt(buildSkillDraftPrompt(input));
+    } finally {
+      if (typeof draftSubscription === "function") {
+        draftSubscription();
+      } else {
+        draftSubscription?.unsubscribe?.();
+      }
+    }
     return stripCodeFences(draft);
   }, []);
 
