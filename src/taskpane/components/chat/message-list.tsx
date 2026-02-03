@@ -31,6 +31,7 @@ function ThinkingBlock({ thinking, isStreaming }: { thinking: string; isStreamin
 }
 
 type ToolCallPart = Extract<MessagePart, { type: "toolCall" }>;
+type ImagePart = Extract<MessagePart, { type: "image" }>;
 
 function ToolCallBlock({ part }: { part: ToolCallPart }) {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -77,6 +78,16 @@ function ToolCallBlock({ part }: { part: ToolCallPart }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function ImageBlock({ part }: { part: ImagePart }) {
+  const src = `data:${part.mimeType};base64,${part.data}`;
+  return (
+    <div className="mt-2 border border-(--chat-border) bg-(--chat-bg-secondary) p-1" style={{ borderRadius: "var(--chat-radius)" }}>
+      <img src={src} alt={part.name ?? "attachment"} className="max-h-48 max-w-full object-contain" loading="lazy" />
+      {part.name && <div className="mt-1 text-[10px] text-(--chat-text-muted) truncate">{part.name}</div>}
     </div>
   );
 }
@@ -155,6 +166,9 @@ function renderParts(parts: MessagePart[], isStreaming: boolean, messageId: stri
     if (part.type === "thinking") {
       return <ThinkingBlock key={key} thinking={part.thinking} isStreaming={isStreamingThinking && isLastPart} />;
     }
+    if (part.type === "image") {
+      return <ImageBlock key={key} part={part} />;
+    }
     if (part.type === "toolCall") {
       return <ToolCallBlock key={key} part={part} />;
     }
@@ -193,6 +207,9 @@ function AssistantBubble({ messages, isStreaming }: { messages: ChatMessage[]; i
         const key = part.type === "toolCall" ? part.id : `${messageId}-${part.type}-${idx}`;
         if (part.type === "thinking") {
           return <ThinkingBlock key={key} thinking={part.thinking} isStreaming={isStreaming && isLast} />;
+        }
+        if (part.type === "image") {
+          return <ImageBlock key={key} part={part} />;
         }
         if (part.type === "toolCall") {
           return <ToolCallBlock key={key} part={part} />;

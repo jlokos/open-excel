@@ -9,6 +9,7 @@ import {
   getModel,
   getModels,
   getProviders,
+  type ImageContent,
   type Model,
   streamSimple,
   type Usage,
@@ -47,9 +48,18 @@ installFetchProxy();
 
 export type ToolCallStatus = "pending" | "running" | "complete" | "error";
 
+export interface ImageAttachment {
+  id: string;
+  name?: string;
+  size?: number;
+  data: string;
+  mimeType: string;
+}
+
 export type MessagePart =
   | { type: "text"; text: string }
   | { type: "thinking"; thinking: string }
+  | ({ type: "image" } & ImageAttachment)
   | {
       type: "toolCall";
       id: string;
@@ -205,6 +215,17 @@ function buildCustomModel(endpoint: CustomEndpointConfig): Model<"openai-complet
     contextWindow: endpoint.contextWindow,
     maxTokens: endpoint.maxTokens ?? Math.floor(endpoint.contextWindow / 4),
   };
+}
+
+function getModelSupportsImages(config: ProviderConfig | null): boolean {
+  if (!config) return false;
+  const isCustom = config.provider === CUSTOM_PROVIDER_ID;
+  if (isCustom) return !!config.customEndpoint?.supportsImages;
+  try {
+    return getModel(config.provider as any, config.model as any).input.includes("image");
+  } catch {
+    return false;
+  }
 }
 
 function buildProxiedUrl(url: string, proxyUrl?: string): string {
@@ -460,6 +481,7 @@ interface ChatState {
   isStreaming: boolean;
   error: string | null;
   providerConfig: ProviderConfig | null;
+  modelSupportsImages: boolean;
   sessionStats: SessionStats;
   currentSession: ChatSession | null;
   sessions: ChatSession[];
@@ -483,7 +505,7 @@ const INITIAL_DEBUG: DebugInfo = {
 
 interface ChatContextValue {
   state: ChatState;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, attachments?: ImageAttachment[]) => Promise<void>;
   setProviderConfig: (config: ProviderConfig) => void;
   clearMessages: () => void;
   abort: () => void;
@@ -506,6 +528,7 @@ interface ChatContextValue {
 const ChatContext = createContext<ChatContextValue | null>(null);
 
 const SYSTEM_PROMPT = `You are an AI assistant integrated into Microsoft Excel with full access to read and modify spreadsheet data.
+If the user attaches images, inspect them and reference what you see. If you cannot access images, say so.
 
 Available tools:
 READ:
@@ -652,11 +675,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const hasAuth = saved?.authMethod === "oauth" ? saved?.oauthProvider : saved?.apiKey;
     const hasModel = isCustom ? saved?.customEndpoint?.modelId : saved?.model;
     const validConfig = saved?.provider && hasAuth && hasModel ? saved : null;
+    const modelSupportsImages = validConfig ? getModelSupportsImages(validConfig) : false;
     return {
       messages: [],
       isStreaming: false,
       error: null,
       providerConfig: validConfig,
+      modelSupportsImages,
       sessionStats: INITIAL_STATS,
       currentSession: null,
       sessions: [],
@@ -880,6 +905,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     async (config: ProviderConfig, systemPrompt: string, apiKey: string) => {
       let contextWindow = 0;
       let baseModel: Model<any>;
+      let modelSupportsImages = false;
 
       const isCustom = config.provider === CUSTOM_PROVIDER_ID;
 
@@ -894,6 +920,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           return;
         }
       }
+      modelSupportsImages = baseModel.input.includes("image");
 
       const oauthCreds =
         config.authMethod === "oauth" && config.oauthProvider
@@ -964,6 +991,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setState((prev) => ({
         ...prev,
         providerConfig: config,
+        modelSupportsImages,
         error: null,
         sessionStats: { ...prev.sessionStats, contextWindow },
       }));
@@ -974,6 +1002,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const setProviderConfig = useCallback(
     async (config: ProviderConfig) => {
       providerConfigRef.current = config;
+      const modelSupportsImages = getModelSupportsImages(config);
 
       // Update global fetch proxy for CORS-restricted APIs
       if (config.useProxy && config.proxyUrl) {
@@ -987,6 +1016,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         setState((prev) => ({
           ...prev,
           providerConfig: config,
+          modelSupportsImages,
           error: config.authMethod === "oauth" ? `Not logged in with ${config.oauthProvider}` : null,
         }));
         return;
@@ -1013,7 +1043,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       if (isStreamingRef.current) {
         pendingConfigRef.current = config;
-        setState((prev) => ({ ...prev, providerConfig: config }));
+        setState((prev) => ({ ...prev, providerConfig: config, modelSupportsImages }));
         return;
       }
 
@@ -1035,10 +1065,16 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, attachments: ImageAttachment[] = []) => {
       const config = providerConfigRef.current;
       if (!config) {
         setState((prev) => ({ ...prev, error: "Please configure your API provider first" }));
+        return;
+      }
+
+      const supportsImages = getModelSupportsImages(config);
+      if (attachments.length > 0 && !supportsImages) {
+        setState((prev) => ({ ...prev, error: "Selected model does not support image inputs" }));
         return;
       }
 
@@ -1093,10 +1129,23 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         await applyConfig(config, systemPromptRef.current, result.apiKey);
       }
 
+      const parts: MessagePart[] = [];
+      if (content.trim()) {
+        parts.push({ type: "text", text: content });
+      }
+      if (attachments.length > 0) {
+        parts.push(
+          ...attachments.map((attachment) => ({
+            type: "image" as const,
+            ...attachment,
+          })),
+        );
+      }
+
       const userMessage: ChatMessage = {
         id: generateId(),
         role: "user",
-        parts: [{ type: "text", text: content }],
+        parts,
         timestamp: Date.now(),
       };
 
@@ -1118,7 +1167,25 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         } catch (err) {
           console.error("[Chat] Failed to get workbook metadata:", err);
         }
-        await agentRef.current!.prompt(promptContent);
+        if (attachments.length > 0) {
+          const names = attachments
+            .map((attachment) => attachment.name)
+            .filter((name): name is string => Boolean(name && name.trim().length > 0));
+          const label =
+            names.length > 0
+              ? `Attached image(s): ${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""}.`
+              : `Attached ${attachments.length} image${attachments.length === 1 ? "" : "s"}.`;
+          promptContent = `${promptContent}\n\n${label}\nUse attached images when relevant.`;
+        }
+        const imageContent: ImageContent[] =
+          attachments.length > 0
+            ? attachments.map((attachment) => ({
+                type: "image" as const,
+                data: attachment.data,
+                mimeType: attachment.mimeType,
+              }))
+            : [];
+        await agentRef.current!.prompt(promptContent, imageContent);
         console.log("[Chat] Full context:", agentRef.current!.state.messages);
       } catch (err) {
         console.error("[Chat] sendMessage error:", err);
