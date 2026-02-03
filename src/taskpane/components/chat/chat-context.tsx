@@ -38,8 +38,12 @@ import {
   type OAuthCredentialRecord,
 } from "../../../lib/storage";
 import { EXCEL_TOOLS } from "../../../lib/tools";
+import { installFetchProxy, enableProxy, disableProxy } from "../../../lib/fetch-proxy";
 import type { BrowserOAuthProviderId, CustomEndpointConfig, ExtendedProviderConfig } from "./types";
 import type { OAuthCredentials } from "./oauth-login-dialog";
+
+// Install fetch proxy on module load
+installFetchProxy();
 
 export type ToolCallStatus = "pending" | "running" | "complete" | "error";
 
@@ -154,10 +158,15 @@ function loadLegacySkills(): Array<{ content?: string; enabled?: boolean; source
 }
 
 function applyProxyToModel(model: Model<any>, config: ProviderConfig): Model<any> {
-  if (!config.useProxy || !config.proxyUrl || !model.baseUrl) return model;
+  if (!config.useProxy || !config.proxyUrl || !model.baseUrl) {
+    return model;
+  }
+  // Use path-based proxy URL so appended paths work correctly
+  // e.g., /proxy/https%3A%2F%2Fapi.example.com/v1/chat -> proxies to https://api.example.com/v1/chat
+  const proxyBase = config.proxyUrl.replace(/\/+$/, "");
   return {
     ...model,
-    baseUrl: `${config.proxyUrl}/?url=${encodeURIComponent(model.baseUrl)}`,
+    baseUrl: `${proxyBase}/${encodeURIComponent(model.baseUrl)}`,
   };
 }
 
@@ -965,6 +974,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const setProviderConfig = useCallback(
     async (config: ProviderConfig) => {
       providerConfigRef.current = config;
+
+      // Update global fetch proxy for CORS-restricted APIs
+      if (config.useProxy && config.proxyUrl) {
+        enableProxy(config.proxyUrl);
+      } else {
+        disableProxy();
+      }
 
       const result = await getApiKeyForConfig(config, oauthCredentialsRef.current, config.proxyUrl);
       if (!result) {

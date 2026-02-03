@@ -89,18 +89,11 @@ export function SettingsPanel() {
   const availableOAuthProviders = OAUTH_PROVIDERS.filter((op) => op.forProviders.includes(provider));
   const supportsOAuth = availableOAuthProviders.length > 0;
 
-  // Reset auth method if provider doesn't support OAuth
-  useEffect(() => {
-    if (!supportsOAuth && authMethod === "oauth") {
-      setAuthMethod("apiKey");
-      setOauthProvider(undefined);
-    }
-  }, [supportsOAuth, authMethod]);
 
   useEffect(() => {
     const isValid = isCustomProvider
       ? customBaseUrl && customModelId
-      : provider && model && (authMethod === "oauth" ? oauthProvider && oauthStatus[oauthProvider] : apiKey);
+      : provider && model && (authMethod === "oauth" ? oauthProvider : apiKey);
 
     if (isValid) {
       const customEndpoint: CustomEndpointConfig | undefined = isCustomProvider
@@ -137,7 +130,6 @@ export function SettingsPanel() {
     thinking,
     authMethod,
     oauthProvider,
-    oauthStatus,
     isCustomProvider,
     customBaseUrl,
     customModelId,
@@ -157,6 +149,21 @@ export function SettingsPanel() {
     } else {
       const providerModels = newProvider ? getModelsForProvider(newProvider) : [];
       setModel(providerModels[0]?.id || "");
+    }
+    // Reset auth method if new provider doesn't support OAuth
+    const newSupportsOAuth = OAUTH_PROVIDERS.some((op) => op.forProviders.includes(newProvider));
+    if (!newSupportsOAuth && authMethod === "oauth") {
+      setAuthMethod("apiKey");
+      setOauthProvider(undefined);
+    }
+  };
+
+  const handleSwitchToOAuth = () => {
+    setAuthMethod("oauth");
+    // Auto-select OAuth provider if user is logged into one
+    const loggedInProvider = availableOAuthProviders.find((op) => oauthStatus[op.id]);
+    if (loggedInProvider && !oauthProvider) {
+      setOauthProvider(loggedInProvider.id);
     }
   };
 
@@ -342,7 +349,7 @@ export function SettingsPanel() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => setAuthMethod("oauth")}
+                      onClick={handleSwitchToOAuth}
                       className={`
                         flex-1 py-1.5 text-xs border transition-colors
                         ${

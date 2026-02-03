@@ -25,18 +25,42 @@ const CORS_HEADERS = {
 
 function proxyHandler(req, res) {
   const requestUrl = req.url || "";
-  const parsed = new URL(requestUrl, "http://localhost");
-  const target = parsed.searchParams.get("url");
+  console.log(`[Proxy] ${req.method} ${requestUrl}`);
 
   if (req.method === "OPTIONS") {
+    console.log("[Proxy] Handling OPTIONS preflight");
     res.writeHead(204, CORS_HEADERS);
     res.end();
     return;
   }
 
+  // Support both path-based and query-based proxy URLs:
+  // Path-based: /proxy/https%3A%2F%2Fexample.com/api/path
+  // Query-based: /proxy?url=https%3A%2F%2Fexample.com (legacy)
+  let target;
+  const queryMatch = requestUrl.match(/^\/?(\?|$)/);
+  if (queryMatch) {
+    // Query-based: ?url=...
+    const parsed = new URL(requestUrl, "http://localhost");
+    target = parsed.searchParams.get("url");
+  } else {
+    // Path-based: /https%3A%2F%2Fexample.com/remaining/path
+    // First segment is the encoded base URL, rest is the path to append
+    const pathWithoutLeadingSlash = requestUrl.replace(/^\//, "");
+    const firstSlashIndex = pathWithoutLeadingSlash.indexOf("/");
+    if (firstSlashIndex === -1) {
+      // No additional path, just the encoded URL
+      target = decodeURIComponent(pathWithoutLeadingSlash);
+    } else {
+      const encodedBase = pathWithoutLeadingSlash.substring(0, firstSlashIndex);
+      const remainingPath = pathWithoutLeadingSlash.substring(firstSlashIndex);
+      target = decodeURIComponent(encodedBase) + remainingPath;
+    }
+  }
+
   if (!target) {
     res.writeHead(400, CORS_HEADERS);
-    res.end("Missing url query parameter.");
+    res.end("Missing url. Use /proxy/https%3A%2F%2Fexample.com/path or /proxy?url=...");
     return;
   }
 
@@ -45,7 +69,7 @@ function proxyHandler(req, res) {
     targetUrl = new URL(target);
   } catch {
     res.writeHead(400, CORS_HEADERS);
-    res.end("Invalid url.");
+    res.end("Invalid url: " + target);
     return;
   }
 
@@ -57,6 +81,7 @@ function proxyHandler(req, res) {
     headers["accept-encoding"] = "identity";
   }
 
+  console.log(`[Proxy] Forwarding to: ${targetUrl.href}`);
   const client = targetUrl.protocol === "https:" ? https : http;
   const proxyReq = client.request(
     targetUrl,
@@ -65,12 +90,14 @@ function proxyHandler(req, res) {
       headers,
     },
     (proxyRes) => {
+      console.log(`[Proxy] Response: ${proxyRes.statusCode} from ${targetUrl.href}`);
       res.writeHead(proxyRes.statusCode || 500, { ...proxyRes.headers, ...CORS_HEADERS });
       proxyRes.pipe(res);
     },
   );
 
   proxyReq.on("error", (err) => {
+    console.error(`[Proxy] Error: ${err.message}`);
     res.writeHead(502, CORS_HEADERS);
     res.end(`Proxy error: ${err.message}`);
   });
@@ -234,6 +261,11 @@ module.exports = async (env, options) => {
       setupMiddlewares: (middlewares, devServer) => {
         if (devServer?.app) {
           devServer.app.use("/proxy", proxyHandler);
+          // Simple test endpoint to verify add-in can reach the server
+          devServer.app.get("/ping", (req, res) => {
+            console.log("[Ping] Request received from add-in");
+            res.json({ ok: true, timestamp: Date.now() });
+          });
         }
         return middlewares;
       },
