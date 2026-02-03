@@ -1,1 +1,1 @@
-export type ChatTab = "chat" | "settings";
+export type ChatTab = "chat" | "settings" | "skills";

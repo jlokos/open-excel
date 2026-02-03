@@ -1,9 +1,10 @@
-import { Check, ChevronDown, MessageSquare, Moon, Plus, Settings, Sun, Trash2 } from "lucide-react";
+import { Check, ChevronDown, MessageSquare, Moon, Plus, Puzzle, Settings, Sun, Trash2 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { ChatProvider, useChat } from "./chat-context";
 import { ChatInput } from "./chat-input";
 import { MessageList } from "./message-list";
 import { SettingsPanel } from "./settings-panel";
+import { SkillsPanel } from "./skills-panel";
 import type { ChatTab } from "./types";
 
 type Theme = "light" | "dark";
@@ -251,6 +252,10 @@ function ChatHeader({
             <Settings size={12} />
             Settings
           </TabButton>
+          <TabButton active={activeTab === "skills"} onClick={() => onTabChange("skills")}>
+            <Puzzle size={12} />
+            Skills
+          </TabButton>
         </div>
         <div className="flex items-center">
           <button
@@ -290,8 +295,10 @@ function ChatContent() {
           <ChatInput />
           <StatsBar />
         </>
-      ) : (
+      ) : activeTab === "settings" ? (
         <SettingsPanel />
+      ) : (
+        <SkillsPanel />
       )}
     </div>
   );

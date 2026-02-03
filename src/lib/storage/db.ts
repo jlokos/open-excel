@@ -1,5 +1,6 @@
 import Dexie, { type Table } from "dexie";
 import type { ChatMessage } from "../../taskpane/components/chat/chat-context";
+import type { SkillFileEntry, SkillMetadata } from "../skills";
 
 export interface ChatSession {
   id: string;
@@ -10,13 +11,27 @@ export interface ChatSession {
   updatedAt: number;
 }
 
+export interface SkillRecord extends SkillMetadata {}
+
+export interface SkillFileRecord extends SkillFileEntry {
+  id: string;
+  skillId: string;
+}
+
 class OpenExcelDB extends Dexie {
   sessions!: Table<ChatSession, string>;
+  skills!: Table<SkillRecord, string>;
+  skillFiles!: Table<SkillFileRecord, string>;
 
   constructor() {
     super("OpenExcelDB_v3");
     this.version(1).stores({
       sessions: "id, workbookId, updatedAt",
+    });
+    this.version(2).stores({
+      sessions: "id, workbookId, updatedAt",
+      skills: "id, name, updatedAt, enabled",
+      skillFiles: "id, skillId, path",
     });
   }
 }
@@ -116,4 +131,51 @@ export async function getOrCreateCurrentSession(workbookId: string): Promise<Cha
     return sessions[0];
   }
   return createSession(workbookId);
+}
+
+export async function listSkills(): Promise<SkillRecord[]> {
+  return db.skills.orderBy("updatedAt").reverse().toArray();
+}
+
+export async function getSkill(skillId: string): Promise<SkillRecord | undefined> {
+  return db.skills.get(skillId);
+}
+
+export async function getSkillByName(name: string): Promise<SkillRecord | undefined> {
+  return db.skills.where("name").equals(name).first();
+}
+
+export async function saveSkill(skill: SkillRecord): Promise<void> {
+  await db.skills.put({ ...skill, updatedAt: Date.now() });
+}
+
+export async function deleteSkill(skillId: string): Promise<void> {
+  await db.transaction("rw", db.skills, db.skillFiles, () => {
+    return db.skills
+      .delete(skillId)
+      .then(() => db.skillFiles.where("skillId").equals(skillId).delete())
+      .then(() => undefined);
+  });
+}
+
+export async function listSkillFiles(skillId: string): Promise<SkillFileRecord[]> {
+  return db.skillFiles.where("skillId").equals(skillId).toArray();
+}
+
+export async function getSkillFile(skillId: string, path: string): Promise<SkillFileRecord | undefined> {
+  return db.skillFiles
+    .where("skillId")
+    .equals(skillId)
+    .and((file) => file.path === path)
+    .first();
+}
+
+export async function upsertSkillPackage(skill: SkillRecord, files: SkillFileRecord[]): Promise<void> {
+  await db.transaction("rw", db.skills, db.skillFiles, () => {
+    return db.skills
+      .put({ ...skill, updatedAt: Date.now() })
+      .then(() => db.skillFiles.where("skillId").equals(skill.id).delete())
+      .then(() => (files.length > 0 ? db.skillFiles.bulkPut(files) : undefined))
+      .then(() => undefined);
+  });
 }
