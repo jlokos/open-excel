@@ -1,6 +1,7 @@
 import {
   Agent,
   type AgentEvent,
+  type AgentMessage,
   type ThinkingLevel as AgentThinkingLevel,
 } from "@mariozechner/pi-agent-core";
 import {
@@ -325,224 +326,260 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const handleAgentEvent = useCallback((event: AgentEvent) => {
-    console.log("[Chat] Agent event:", event.type, event);
-    switch (event.type) {
-      case "message_start": {
-        if (event.message.role === "assistant") {
-          const id = generateId();
-          streamingMessageIdRef.current = id;
-          const parts = extractPartsFromAssistantMessage(event.message);
-          const chatMessage: ChatMessage = {
-            id,
-            role: "assistant",
-            parts,
-            timestamp: event.message.timestamp,
-          };
-          setState((prev) => ({
-            ...prev,
-            messages: [...prev.messages, chatMessage],
-          }));
+  const buildCanonicalState = useCallback(
+    (
+      agentMessages: AgentMessage[],
+      contextWindow: number,
+      previousMessages: ChatMessage[] = [],
+    ) => ({
+      messages: agentMessagesToChatMessages(agentMessages, previousMessages),
+      sessionStats: {
+        ...deriveStats(agentMessages),
+        contextWindow,
+      },
+    }),
+    [],
+  );
+
+  const syncCanonicalState = useCallback(
+    (agentMessages: AgentMessage[], isStreaming?: boolean) => {
+      setState((prev) => {
+        const canonical = buildCanonicalState(
+          agentMessages,
+          prev.sessionStats.contextWindow,
+          prev.messages,
+        );
+        return {
+          ...prev,
+          ...canonical,
+          ...(isStreaming === undefined ? {} : { isStreaming }),
+        };
+      });
+    },
+    [buildCanonicalState],
+  );
+
+  const handleAgentEvent = useCallback(
+    (event: AgentEvent) => {
+      console.log("[Chat] Agent event:", event.type, event);
+      switch (event.type) {
+        case "message_start": {
+          if (event.message.role === "assistant") {
+            const id = generateId();
+            streamingMessageIdRef.current = id;
+            const parts = extractPartsFromAssistantMessage(event.message);
+            const chatMessage: ChatMessage = {
+              id,
+              role: "assistant",
+              parts,
+              timestamp: event.message.timestamp,
+            };
+            setState((prev) => ({
+              ...prev,
+              messages: [...prev.messages, chatMessage],
+            }));
+          }
+          break;
         }
-        break;
-      }
-      case "message_update": {
-        if (
-          event.message.role === "assistant" &&
-          streamingMessageIdRef.current
-        ) {
-          setState((prev) => {
-            const messages = [...prev.messages];
-            const idx = messages.findIndex(
-              (m) => m.id === streamingMessageIdRef.current,
+        case "message_update": {
+          const streamingMessageId = streamingMessageIdRef.current;
+          if (event.message.role === "assistant" && streamingMessageId) {
+            setState((prev) => {
+              const messages = [...prev.messages];
+              const idx = messages.findIndex(
+                (m) => m.id === streamingMessageId,
+              );
+              if (idx !== -1) {
+                const parts = extractPartsFromAssistantMessage(
+                  event.message,
+                  messages[idx].parts,
+                );
+                messages[idx] = { ...messages[idx], parts };
+              }
+              return { ...prev, messages };
+            });
+          }
+          break;
+        }
+        case "message_end": {
+          if (event.message.role === "assistant") {
+            const streamingMessageId = streamingMessageIdRef.current;
+            const assistantMsg = event.message as AssistantMessage;
+            const isError =
+              assistantMsg.stopReason === "error" ||
+              assistantMsg.stopReason === "aborted";
+            const errorMessage = assistantMsg.errorMessage || "Request failed";
+            console.log("[Chat] Assistant message result:", event.message);
+            console.log("[Chat] Usage:", assistantMsg.usage);
+            console.log(
+              "[Chat] stopReason:",
+              assistantMsg.stopReason,
+              "errorMessage:",
+              assistantMsg.errorMessage,
             );
-            if (idx !== -1) {
+
+            setState((prev) => {
+              const messages = [...prev.messages];
+              const idx = streamingMessageId
+                ? messages.findIndex((m) => m.id === streamingMessageId)
+                : -1;
+              const existingParts = idx !== -1 ? messages[idx].parts : [];
               const parts = extractPartsFromAssistantMessage(
                 event.message,
-                messages[idx].parts,
+                existingParts,
               );
-              messages[idx] = { ...messages[idx], parts };
+
+              if (idx !== -1) {
+                messages[idx] = { ...messages[idx], parts };
+              } else {
+                messages.push({
+                  id: generateId(),
+                  role: "assistant",
+                  parts,
+                  timestamp: event.message.timestamp,
+                });
+              }
+
+              return {
+                ...prev,
+                messages,
+                error: isError ? errorMessage : prev.error,
+              };
+            });
+            if (streamingMessageIdRef.current === streamingMessageId) {
+              streamingMessageIdRef.current = null;
+            }
+          }
+          break;
+        }
+        case "tool_execution_start": {
+          setState((prev) => {
+            const messages = [...prev.messages];
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const msg = messages[i];
+              const partIdx = msg.parts.findIndex(
+                (p) => p.type === "toolCall" && p.id === event.toolCallId,
+              );
+              if (partIdx !== -1) {
+                const parts = [...msg.parts];
+                const part = parts[partIdx];
+                if (part.type === "toolCall") {
+                  parts[partIdx] = { ...part, status: "running" };
+                  messages[i] = { ...msg, parts };
+                }
+                break;
+              }
             }
             return { ...prev, messages };
           });
+          break;
         }
-        break;
-      }
-      case "message_end": {
-        if (event.message.role === "assistant") {
-          const assistantMsg = event.message as AssistantMessage;
-          const isError =
-            assistantMsg.stopReason === "error" ||
-            assistantMsg.stopReason === "aborted";
-          console.log("[Chat] Assistant message result:", event.message);
-          console.log("[Chat] Usage:", assistantMsg.usage);
-          console.log(
-            "[Chat] stopReason:",
-            assistantMsg.stopReason,
-            "errorMessage:",
-            assistantMsg.errorMessage,
-          );
+        case "tool_execution_update": {
+          setState((prev) => {
+            const messages = [...prev.messages];
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const msg = messages[i];
+              const partIdx = msg.parts.findIndex(
+                (p) => p.type === "toolCall" && p.id === event.toolCallId,
+              );
+              if (partIdx !== -1) {
+                const parts = [...msg.parts];
+                const part = parts[partIdx];
+                if (part.type === "toolCall") {
+                  let partialText: string;
+                  if (typeof event.partialResult === "string") {
+                    partialText = event.partialResult;
+                  } else if (
+                    event.partialResult?.content &&
+                    Array.isArray(event.partialResult.content)
+                  ) {
+                    partialText = event.partialResult.content
+                      .filter((c: { type: string }) => c.type === "text")
+                      .map((c: { text: string }) => c.text)
+                      .join("\n");
+                  } else {
+                    partialText = JSON.stringify(event.partialResult, null, 2);
+                  }
+                  parts[partIdx] = { ...part, result: partialText };
+                  messages[i] = { ...msg, parts };
+                }
+                break;
+              }
+            }
+            return { ...prev, messages };
+          });
+          break;
+        }
+        case "tool_execution_end": {
+          let resultText: string;
+          if (typeof event.result === "string") {
+            resultText = event.result;
+          } else if (
+            event.result?.content &&
+            Array.isArray(event.result.content)
+          ) {
+            resultText = event.result.content
+              .filter((c: { type: string }) => c.type === "text")
+              .map((c: { text: string }) => c.text)
+              .join("\n");
+          } else {
+            resultText = JSON.stringify(event.result, null, 2);
+          }
+
+          if (!event.isError && followModeRef.current) {
+            const dirtyRanges = parseDirtyRanges(resultText);
+            if (dirtyRanges && dirtyRanges.length > 0) {
+              const first = dirtyRanges[0];
+              if (first.sheetId >= 0 && first.range !== "*") {
+                navigateTo(first.sheetId, first.range).catch((err) => {
+                  console.error("[FollowMode] Navigation failed:", err);
+                });
+              } else if (first.sheetId >= 0) {
+                // For whole-sheet changes, just activate the sheet
+                navigateTo(first.sheetId).catch((err) => {
+                  console.error("[FollowMode] Navigation failed:", err);
+                });
+              }
+            }
+          }
 
           setState((prev) => {
             const messages = [...prev.messages];
-            const idx = messages.findIndex(
-              (m) => m.id === streamingMessageIdRef.current,
-            );
-
-            if (isError) {
-              if (idx !== -1) {
-                messages.splice(idx, 1);
-              }
-            } else if (idx !== -1) {
-              const parts = extractPartsFromAssistantMessage(
-                event.message,
-                messages[idx].parts,
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const msg = messages[i];
+              const partIdx = msg.parts.findIndex(
+                (p) => p.type === "toolCall" && p.id === event.toolCallId,
               );
-              messages[idx] = { ...messages[idx], parts };
-            }
-
-            return {
-              ...prev,
-              messages,
-              error: isError
-                ? assistantMsg.errorMessage || "Request failed"
-                : prev.error,
-              sessionStats: isError
-                ? prev.sessionStats
-                : {
-                    ...deriveStats(agentRef.current?.state.messages ?? []),
-                    contextWindow: prev.sessionStats.contextWindow,
-                  },
-            };
-          });
-          streamingMessageIdRef.current = null;
-        }
-        break;
-      }
-      case "tool_execution_start": {
-        setState((prev) => {
-          const messages = [...prev.messages];
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            const partIdx = msg.parts.findIndex(
-              (p) => p.type === "toolCall" && p.id === event.toolCallId,
-            );
-            if (partIdx !== -1) {
-              const parts = [...msg.parts];
-              const part = parts[partIdx];
-              if (part.type === "toolCall") {
-                parts[partIdx] = { ...part, status: "running" };
-                messages[i] = { ...msg, parts };
-              }
-              break;
-            }
-          }
-          return { ...prev, messages };
-        });
-        break;
-      }
-      case "tool_execution_update": {
-        setState((prev) => {
-          const messages = [...prev.messages];
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            const partIdx = msg.parts.findIndex(
-              (p) => p.type === "toolCall" && p.id === event.toolCallId,
-            );
-            if (partIdx !== -1) {
-              const parts = [...msg.parts];
-              const part = parts[partIdx];
-              if (part.type === "toolCall") {
-                let partialText: string;
-                if (typeof event.partialResult === "string") {
-                  partialText = event.partialResult;
-                } else if (
-                  event.partialResult?.content &&
-                  Array.isArray(event.partialResult.content)
-                ) {
-                  partialText = event.partialResult.content
-                    .filter((c: { type: string }) => c.type === "text")
-                    .map((c: { text: string }) => c.text)
-                    .join("\n");
-                } else {
-                  partialText = JSON.stringify(event.partialResult, null, 2);
+              if (partIdx !== -1) {
+                const parts = [...msg.parts];
+                const part = parts[partIdx];
+                if (part.type === "toolCall") {
+                  parts[partIdx] = {
+                    ...part,
+                    status: event.isError ? "error" : "complete",
+                    result: resultText,
+                  };
+                  messages[i] = { ...msg, parts };
                 }
-                parts[partIdx] = { ...part, result: partialText };
-                messages[i] = { ...msg, parts };
+                break;
               }
-              break;
             }
-          }
-          return { ...prev, messages };
-        });
-        break;
-      }
-      case "tool_execution_end": {
-        let resultText: string;
-        if (typeof event.result === "string") {
-          resultText = event.result;
-        } else if (
-          event.result?.content &&
-          Array.isArray(event.result.content)
-        ) {
-          resultText = event.result.content
-            .filter((c: { type: string }) => c.type === "text")
-            .map((c: { text: string }) => c.text)
-            .join("\n");
-        } else {
-          resultText = JSON.stringify(event.result, null, 2);
+            return { ...prev, messages };
+          });
+          break;
         }
-
-        if (!event.isError && followModeRef.current) {
-          const dirtyRanges = parseDirtyRanges(resultText);
-          if (dirtyRanges && dirtyRanges.length > 0) {
-            const first = dirtyRanges[0];
-            if (first.sheetId >= 0 && first.range !== "*") {
-              navigateTo(first.sheetId, first.range).catch((err) => {
-                console.error("[FollowMode] Navigation failed:", err);
-              });
-            } else if (first.sheetId >= 0) {
-              // For whole-sheet changes, just activate the sheet
-              navigateTo(first.sheetId).catch((err) => {
-                console.error("[FollowMode] Navigation failed:", err);
-              });
-            }
-          }
+        case "agent_end": {
+          isStreamingRef.current = false;
+          const currentAgentMessages = agentRef.current?.state.messages;
+          const agentMessages = currentAgentMessages ?? event.messages ?? [];
+          syncCanonicalState(agentMessages, false);
+          streamingMessageIdRef.current = null;
+          break;
         }
-
-        setState((prev) => {
-          const messages = [...prev.messages];
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            const partIdx = msg.parts.findIndex(
-              (p) => p.type === "toolCall" && p.id === event.toolCallId,
-            );
-            if (partIdx !== -1) {
-              const parts = [...msg.parts];
-              const part = parts[partIdx];
-              if (part.type === "toolCall") {
-                parts[partIdx] = {
-                  ...part,
-                  status: event.isError ? "error" : "complete",
-                  result: resultText,
-                };
-                messages[i] = { ...msg, parts };
-              }
-              break;
-            }
-          }
-          return { ...prev, messages };
-        });
-        break;
       }
-      case "agent_end": {
-        isStreamingRef.current = false;
-        setState((prev) => ({ ...prev, isStreaming: false }));
-        streamingMessageIdRef.current = null;
-        break;
-      }
-    }
-  }, []);
+    },
+    [syncCanonicalState],
+  );
 
   const configRef = useRef<ProviderConfig | null>(null);
 
@@ -798,60 +835,61 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshSessions]);
 
-  const switchSession = useCallback(async (sessionId: string) => {
-    console.log(
-      "[Chat] switchSession called:",
-      sessionId,
-      "current:",
-      currentSessionIdRef.current,
-    );
-    if (currentSessionIdRef.current === sessionId) return;
-    if (isStreamingRef.current) {
-      console.log("[Chat] switchSession blocked: streaming in progress");
-      return;
-    }
-    agentRef.current?.reset();
-    try {
-      const [session, vfsFiles] = await Promise.all([
-        getSession(sessionId),
-        loadVfsFiles(sessionId),
-      ]);
+  const switchSession = useCallback(
+    async (sessionId: string) => {
       console.log(
-        "[Chat] switchSession loaded:",
-        session?.id,
-        "agentMessages:",
-        session?.agentMessages.length,
-        "vfs:",
-        vfsFiles.length,
+        "[Chat] switchSession called:",
+        sessionId,
+        "current:",
+        currentSessionIdRef.current,
       );
-      if (!session) {
-        console.error("[Chat] Session not found:", sessionId);
+      if (currentSessionIdRef.current === sessionId) return;
+      if (isStreamingRef.current) {
+        console.log("[Chat] switchSession blocked: streaming in progress");
         return;
       }
-      await restoreVfs(vfsFiles);
-      currentSessionIdRef.current = session.id;
+      agentRef.current?.reset();
+      try {
+        const [session, vfsFiles] = await Promise.all([
+          getSession(sessionId),
+          loadVfsFiles(sessionId),
+        ]);
+        console.log(
+          "[Chat] switchSession loaded:",
+          session?.id,
+          "agentMessages:",
+          session?.agentMessages.length,
+          "vfs:",
+          vfsFiles.length,
+        );
+        if (!session) {
+          console.error("[Chat] Session not found:", sessionId);
+          return;
+        }
+        await restoreVfs(vfsFiles);
+        currentSessionIdRef.current = session.id;
 
-      if (session.agentMessages.length > 0 && agentRef.current) {
-        agentRef.current.replaceMessages(session.agentMessages);
+        if (session.agentMessages.length > 0 && agentRef.current) {
+          agentRef.current.replaceMessages(session.agentMessages);
+        }
+
+        const uploadNames = await listUploads();
+        setState((prev) => ({
+          ...prev,
+          ...buildCanonicalState(
+            session.agentMessages,
+            prev.sessionStats.contextWindow,
+          ),
+          currentSession: session,
+          error: null,
+          uploads: uploadNames.map((name) => ({ name, size: 0 })),
+        }));
+      } catch (err) {
+        console.error("[Chat] Failed to switch session:", err);
       }
-
-      const uploadNames = await listUploads();
-      const stats = deriveStats(session.agentMessages);
-      setState((prev) => ({
-        ...prev,
-        messages: agentMessagesToChatMessages(session.agentMessages),
-        currentSession: session,
-        error: null,
-        sessionStats: {
-          ...stats,
-          contextWindow: prev.sessionStats.contextWindow,
-        },
-        uploads: uploadNames.map((name) => ({ name, size: 0 })),
-      }));
-    } catch (err) {
-      console.error("[Chat] Failed to switch session:", err);
-    }
-  }, []);
+    },
+    [buildCanonicalState],
+  );
 
   const deleteCurrentSession = useCallback(async () => {
     if (!currentSessionIdRef.current || !workbookIdRef.current) return;
@@ -873,19 +911,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
     await refreshSessions();
     const uploadNames = await listUploads();
-    const stats = deriveStats(session.agentMessages);
     setState((prev) => ({
       ...prev,
-      messages: agentMessagesToChatMessages(session.agentMessages),
+      ...buildCanonicalState(
+        session.agentMessages,
+        prev.sessionStats.contextWindow,
+      ),
       currentSession: session,
       error: null,
-      sessionStats: {
-        ...stats,
-        contextWindow: prev.sessionStats.contextWindow,
-      },
       uploads: uploadNames.map((name) => ({ name, size: 0 })),
     }));
-  }, [refreshSessions]);
+  }, [refreshSessions, buildCanonicalState]);
 
   const prevStreamingRef = useRef(false);
   useEffect(() => {
@@ -896,6 +932,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     ) {
       const sessionId = currentSessionIdRef.current;
       const agentMessages = agentRef.current?.state.messages ?? [];
+      syncCanonicalState(agentMessages);
       // Snapshot VFS first (returns native Promise), then save to IndexedDB.
       (async () => {
         try {
@@ -915,7 +952,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       })();
     }
     prevStreamingRef.current = state.isStreaming;
-  }, [state.isStreaming, refreshSessions]);
+  }, [state.isStreaming, refreshSessions, syncCanonicalState]);
 
   useEffect(() => {
     return () => {
@@ -971,7 +1008,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
 
         const uploadNames = await listUploads();
-        const stats = deriveStats(session.agentMessages);
         console.log(
           "[Chat] Loaded session:",
           session.id,
@@ -982,21 +1018,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         );
         setState((prev) => ({
           ...prev,
-          messages: agentMessagesToChatMessages(session.agentMessages),
+          ...buildCanonicalState(
+            session.agentMessages,
+            prev.sessionStats.contextWindow,
+          ),
           currentSession: session,
           sessions,
           skills,
-          sessionStats: {
-            ...stats,
-            contextWindow: prev.sessionStats.contextWindow,
-          },
           uploads: uploadNames.map((name) => ({ name, size: 0 })),
         }));
       })
       .catch((err) => {
         console.error("[Chat] Failed to load session:", err);
       });
-  }, [applyConfig]);
+  }, [applyConfig, buildCanonicalState]);
 
   const getSheetName = useCallback(
     (sheetId: number): string | undefined => state.sheetNames[sheetId],

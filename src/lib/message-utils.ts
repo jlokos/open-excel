@@ -72,7 +72,7 @@ export function extractPartsFromAssistantMessage(
     }
   }
 
-  return assistantMsg.content.map((block): MessagePart => {
+  const parts = assistantMsg.content.map((block): MessagePart => {
     if (block.type === "text") {
       return { type: "text", text: block.text };
     }
@@ -89,17 +89,59 @@ export function extractPartsFromAssistantMessage(
       result: existing?.type === "toolCall" ? existing.result : undefined,
     };
   });
+
+  const hasRenderableContent = parts.some((part) => {
+    if (part.type === "toolCall") return true;
+    if (part.type === "text") return part.text.trim().length > 0;
+    return part.thinking.trim().length > 0;
+  });
+
+  if (
+    !hasRenderableContent &&
+    (assistantMsg.stopReason === "error" ||
+      assistantMsg.stopReason === "aborted")
+  ) {
+    const errorMessage = assistantMsg.errorMessage || "Request failed";
+    return [{ type: "text", text: `Error: ${errorMessage}` }];
+  }
+
+  return parts;
 }
 
 export function agentMessagesToChatMessages(
   agentMessages: AgentMessage[],
+  previousMessages: ChatMessage[] = [],
 ): ChatMessage[] {
+  const reusableIds = new Map<string, string[]>();
+  for (const msg of previousMessages) {
+    const key = `${msg.role}:${msg.timestamp}`;
+    const ids = reusableIds.get(key);
+    if (ids) {
+      ids.push(msg.id);
+    } else {
+      reusableIds.set(key, [msg.id]);
+    }
+  }
+
+  const takeReusableId = (
+    role: ChatMessage["role"],
+    timestamp: number,
+  ): string => {
+    const key = `${role}:${timestamp}`;
+    const ids = reusableIds.get(key);
+    if (ids && ids.length > 0) {
+      const reused = ids.shift();
+      if (reused) return reused;
+    }
+    return generateId();
+  };
+
   const result: ChatMessage[] = [];
   for (const msg of agentMessages) {
     if (msg.role === "user") {
       const text = stripEnrichment((msg as UserMessage).content);
       result.push({
-        id: generateId(),
+        id: takeReusableId("user", msg.timestamp),
         role: "user",
         parts: [{ type: "text", text }],
         timestamp: msg.timestamp,
@@ -107,7 +149,7 @@ export function agentMessagesToChatMessages(
     } else if (msg.role === "assistant") {
       const parts = extractPartsFromAssistantMessage(msg);
       result.push({
-        id: generateId(),
+        id: takeReusableId("assistant", msg.timestamp),
         role: "assistant",
         parts,
         timestamp: msg.timestamp,

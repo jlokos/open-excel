@@ -45,29 +45,96 @@ interface OpenExcelSchema extends DBSchema {
 }
 
 let dbPromise: Promise<IDBPDatabase<OpenExcelSchema>> | null = null;
+const DB_NAME = "OpenExcelDB_v3";
+const MIN_DB_VERSION = 30;
+
+function isVersionError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    error.name === "VersionError"
+  );
+}
+
+function hasRequiredSchema(db: IDBPDatabase<OpenExcelSchema>): boolean {
+  if (!db.objectStoreNames.contains("sessions")) return false;
+  if (!db.objectStoreNames.contains("vfsFiles")) return false;
+  if (!db.objectStoreNames.contains("skillFiles")) return false;
+
+  const sessions = db.transaction("sessions", "readonly").store;
+  if (!sessions.indexNames.contains("workbookId")) return false;
+  if (!sessions.indexNames.contains("updatedAt")) return false;
+
+  const vfsFiles = db.transaction("vfsFiles", "readonly").store;
+  if (!vfsFiles.indexNames.contains("sessionId")) return false;
+
+  const skillFiles = db.transaction("skillFiles", "readonly").store;
+  return skillFiles.indexNames.contains("skillName");
+}
+
+function openDbAtVersion(
+  version: number,
+): Promise<IDBPDatabase<OpenExcelSchema>> {
+  return openDB<OpenExcelSchema>(DB_NAME, version, {
+    upgrade(db, _oldVersion, _newVersion, transaction) {
+      const sessions = db.objectStoreNames.contains("sessions")
+        ? transaction.objectStore("sessions")
+        : db.createObjectStore("sessions", { keyPath: "id" });
+      if (!sessions.indexNames.contains("workbookId")) {
+        sessions.createIndex("workbookId", "workbookId");
+      }
+      if (!sessions.indexNames.contains("updatedAt")) {
+        sessions.createIndex("updatedAt", "updatedAt");
+      }
+
+      const vfsFiles = db.objectStoreNames.contains("vfsFiles")
+        ? transaction.objectStore("vfsFiles")
+        : db.createObjectStore("vfsFiles", { keyPath: "id" });
+      if (!vfsFiles.indexNames.contains("sessionId")) {
+        vfsFiles.createIndex("sessionId", "sessionId");
+      }
+
+      const skillFiles = db.objectStoreNames.contains("skillFiles")
+        ? transaction.objectStore("skillFiles")
+        : db.createObjectStore("skillFiles", { keyPath: "id" });
+      if (!skillFiles.indexNames.contains("skillName")) {
+        skillFiles.createIndex("skillName", "skillName");
+      }
+    },
+  });
+}
+
+async function openDbWithFallback(): Promise<IDBPDatabase<OpenExcelSchema>> {
+  try {
+    // Dexie used version(3) which maps to IndexedDB version 30.
+    // Open at >=30 for compatibility with old data.
+    return await openDbAtVersion(MIN_DB_VERSION);
+  } catch (error) {
+    if (!isVersionError(error)) {
+      throw error;
+    }
+
+    console.warn(
+      `[DB] ${DB_NAME} is at a higher version than ${MIN_DB_VERSION}. Retrying with existing version.`,
+    );
+
+    const existingDb = await openDB<OpenExcelSchema>(DB_NAME);
+    if (hasRequiredSchema(existingDb)) {
+      return existingDb;
+    }
+
+    const targetVersion = Math.max(MIN_DB_VERSION, existingDb.version + 1);
+    existingDb.close();
+    return openDbAtVersion(targetVersion);
+  }
+}
 
 function getDb(): Promise<IDBPDatabase<OpenExcelSchema>> {
   if (!dbPromise) {
-    // Dexie used version(3) which maps to IndexedDB version 30.
-    // We must open at >=30 to be compatible with existing databases.
-    dbPromise = openDB<OpenExcelSchema>("OpenExcelDB_v3", 30, {
-      upgrade(db, oldVersion) {
-        if (oldVersion < 10) {
-          const sessions = db.createObjectStore("sessions", { keyPath: "id" });
-          sessions.createIndex("workbookId", "workbookId");
-          sessions.createIndex("updatedAt", "updatedAt");
-        }
-        if (oldVersion < 20) {
-          const vfsFiles = db.createObjectStore("vfsFiles", { keyPath: "id" });
-          vfsFiles.createIndex("sessionId", "sessionId");
-        }
-        if (oldVersion < 30) {
-          const skillFiles = db.createObjectStore("skillFiles", {
-            keyPath: "id",
-          });
-          skillFiles.createIndex("skillName", "skillName");
-        }
-      },
+    dbPromise = openDbWithFallback().catch((error) => {
+      dbPromise = null;
+      throw error;
     });
   }
   return dbPromise;
