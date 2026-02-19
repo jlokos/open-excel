@@ -136,7 +136,86 @@ interface ChatContextValue {
 
 const ChatContext = createContext<ChatContextValue | null>(null);
 
-function buildSystemPrompt(skills: SkillMeta[]): string {
+interface ExcelLocaleInfo {
+  formulaLanguage: string | null;
+  displayLanguage: string | null;
+  cultureName: string | null;
+  decimalSeparator: string | null;
+  thousandsSeparator: string | null;
+  formulaArgumentSeparator: string | null;
+}
+
+function inferFormulaArgumentSeparator(
+  decimalSeparator: string | null,
+): string | null {
+  if (!decimalSeparator) return null;
+  return decimalSeparator === "," ? ";" : ",";
+}
+
+async function loadExcelLocaleInfo(): Promise<ExcelLocaleInfo> {
+  const formulaLanguage = Office.context.contentLanguage ?? null;
+  const displayLanguage = Office.context.displayLanguage ?? null;
+
+  let cultureName: string | null = null;
+  let decimalSeparator: string | null = null;
+  let thousandsSeparator: string | null = null;
+
+  try {
+    await Excel.run(async (context) => {
+      const app = context.workbook.application;
+      app.load("decimalSeparator,thousandsSeparator,cultureInfo/name");
+      await context.sync();
+
+      cultureName = app.cultureInfo.name ?? null;
+      decimalSeparator = app.decimalSeparator ?? null;
+      thousandsSeparator = app.thousandsSeparator ?? null;
+    });
+  } catch (err) {
+    console.warn("[Chat] Failed to load Excel locale info:", err);
+  }
+
+  return {
+    formulaLanguage,
+    displayLanguage,
+    cultureName,
+    decimalSeparator,
+    thousandsSeparator,
+    formulaArgumentSeparator: inferFormulaArgumentSeparator(decimalSeparator),
+  };
+}
+
+function buildLocalePromptSection(locale: ExcelLocaleInfo | null): string {
+  if (!locale) return "";
+
+  const hasAnyValue =
+    locale.formulaLanguage ||
+    locale.displayLanguage ||
+    locale.cultureName ||
+    locale.decimalSeparator ||
+    locale.thousandsSeparator ||
+    locale.formulaArgumentSeparator;
+  if (!hasAnyValue) return "";
+
+  const lines = [
+    "",
+    "EXCEL LOCALE (AUTO-DETECTED):",
+    `- Formula language (Office editing language): ${locale.formulaLanguage ?? "unknown"}`,
+    `- Display language: ${locale.displayLanguage ?? "unknown"}`,
+    `- Excel culture: ${locale.cultureName ?? "unknown"}`,
+    `- Decimal separator: ${locale.decimalSeparator ?? "unknown"}`,
+    `- Thousands separator: ${locale.thousandsSeparator ?? "unknown"}`,
+    `- Formula argument separator: ${locale.formulaArgumentSeparator ?? "unknown"}${locale.decimalSeparator ? " (inferred from decimal separator)" : ""}`,
+    "",
+    "When writing formulas, always use the localized function names and separators shown above.",
+  ];
+
+  return lines.join("\n");
+}
+
+function buildSystemPrompt(
+  skills: SkillMeta[],
+  locale: ExcelLocaleInfo | null,
+): string {
   return `You are an AI assistant integrated into Microsoft Excel with full access to read and modify spreadsheet data.
 
 Available tools:
@@ -193,6 +272,8 @@ Citations: Use markdown links with #cite: hash to reference sheets/cells. Clicki
 - Cell/range: [A1:B10](#cite:sheetId!A1:B10)
 Example: [Exchange Ratio](#cite:3) or [see cell B5](#cite:3!B5)
 
+${buildLocalePromptSection(locale)}
+
 When the user asks about their data, read it first. Be concise. Use A1 notation for cell references.
 
 ${buildSkillsPromptSection(skills)}
@@ -232,6 +313,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const currentSessionIdRef = useRef<string | null>(null);
   const followModeRef = useRef(state.providerConfig?.followMode ?? true);
   const skillsRef = useRef<SkillMeta[]>([]);
+  const localeInfoRef = useRef<ExcelLocaleInfo | null>(null);
 
   const availableProviders = getProviders();
 
@@ -513,7 +595,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         agentRef.current.abort();
       }
 
-      const systemPrompt = buildSystemPrompt(skillsRef.current);
+      const systemPrompt = buildSystemPrompt(
+        skillsRef.current,
+        localeInfoRef.current,
+      );
       console.log(
         "[Chat] Skills in prompt:",
         skillsRef.current.length,
@@ -857,6 +942,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           "skills:",
           skills.map((s) => s.name),
         );
+        localeInfoRef.current = await loadExcelLocaleInfo();
+        console.log("[Chat] Excel locale info:", localeInfoRef.current);
 
         // Now apply provider config — agent gets the correct system prompt with skills
         const saved = loadSavedConfig();
