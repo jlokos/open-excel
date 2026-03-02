@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   agentMessagesToChatMessages,
   extractPartsFromAssistantMessage,
+  stripEnrichment,
   type ChatMessage,
 } from "../src/lib/message-utils";
 
@@ -94,5 +95,10 @@ describe("message utils", () => {
     expect(rebuilt[1].parts).toEqual([
       { type: "text", text: "Error: Load failed" },
     ]);
+  });
+
+  it("strips wb_index_context and wb_context enrichments", () => {
+    const enriched = `<attachments>\n/home/user/uploads/data.csv\n</attachments>\n\n<wb_index_context>\nretrieved style hints\n</wb_index_context>\n\n<wb_context>\n{\"activeSheetId\":1}\n</wb_context>\n\nSummarize this sheet`;
+    expect(stripEnrichment(enriched)).toBe("Summarize this sheet");
   });
 });

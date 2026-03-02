@@ -21,8 +21,14 @@ import {
   useRef,
   useState,
 } from "react";
-import type { DirtyRange } from "../../../lib/dirty-tracker";
+import { type DirtyRange, mergeRanges } from "../../../lib/dirty-tracker";
 import { getWorkbookMetadata, navigateTo } from "../../../lib/excel/api";
+import {
+  buildFullWorkbookIndex,
+  buildIndexPromptContext,
+  type IndexStatus,
+  updateIndexForDirtyRanges,
+} from "../../../lib/indexing";
 import {
   agentMessagesToChatMessages,
   type ChatMessage,
@@ -61,6 +67,7 @@ import {
   getSession,
   listSessions,
   loadVfsFiles,
+  loadWorkbookIndex,
   saveSession,
   saveVfsFiles,
 } from "../../../lib/storage";
@@ -112,6 +119,10 @@ interface ChatState {
   uploads: UploadedFile[];
   isUploading: boolean;
   skills: SkillMeta[];
+  indexStatus: IndexStatus;
+  indexError: string | null;
+  indexUpdatedAt: number | null;
+  indexBlockCount: number;
 }
 
 const INITIAL_STATS: SessionStats = { ...deriveStats([]), contextWindow: 0 };
@@ -133,6 +144,7 @@ interface ChatContextValue {
   removeUpload: (name: string) => Promise<void>;
   installSkill: (files: File[]) => Promise<void>;
   uninstallSkill: (name: string) => Promise<void>;
+  refreshWorkbookIndex: () => Promise<void>;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -269,10 +281,17 @@ EXCEL WRITE:
 - resize_range: Adjust column widths and row heights
 - modify_object: Create/update/delete charts and pivot tables
 
+FORMAT SAFETY:
+- If set_cell_range returns a formatting overwrite error, ask the user for confirmation and retry with allow_format_overwrite=true.
+- Do not set allow_format_overwrite=true on first attempt unless the user explicitly asked to overwrite existing formatting.
+
 Citations: Use markdown links with #cite: hash to reference sheets/cells. Clicking navigates there.
 - Sheet only: [Sheet Name](#cite:sheetId)
 - Cell/range: [A1:B10](#cite:sheetId!A1:B10)
 Example: [Exchange Ratio](#cite:3) or [see cell B5](#cite:3!B5)
+
+When a <wb_index_context> section is present in user messages, treat it as preferred workbook style/template guidance.
+Mirror those patterns for new output unless user instructions conflict.
 
 ${buildLocalePromptSection(locale)}
 
@@ -303,6 +322,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       uploads: [],
       isUploading: false,
       skills: [],
+      indexStatus: "idle",
+      indexError: null,
+      indexUpdatedAt: null,
+      indexBlockCount: 0,
     };
   });
 
@@ -316,6 +339,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const followModeRef = useRef(state.providerConfig?.followMode ?? true);
   const skillsRef = useRef<SkillMeta[]>([]);
   const localeInfoRef = useRef<ExcelLocaleInfo | null>(null);
+  const indexingEnabledRef = useRef(true);
+  const isIndexingRef = useRef(false);
+  const pendingDirtyRangesRef = useRef<DirtyRange[]>([]);
+  const forceFullIndexRef = useRef(false);
 
   const availableProviders = getProviders();
 
@@ -359,6 +386,84 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     },
     [buildCanonicalState],
   );
+
+  const runWorkbookIndexJob = useCallback(
+    async (kind: "full" | "dirty", dirtyRanges: DirtyRange[] = []) => {
+      if (!indexingEnabledRef.current) return;
+      const workbookId = workbookIdRef.current;
+      if (!workbookId) return;
+
+      if (isIndexingRef.current) {
+        if (kind === "full") {
+          forceFullIndexRef.current = true;
+        } else if (dirtyRanges.length > 0) {
+          pendingDirtyRangesRef.current = mergeRanges([
+            ...pendingDirtyRangesRef.current,
+            ...dirtyRanges,
+          ]);
+        }
+        setState((prev) => ({
+          ...prev,
+          indexStatus:
+            prev.indexStatus === "ready" ? "stale" : prev.indexStatus,
+        }));
+        return;
+      }
+
+      isIndexingRef.current = true;
+      setState((prev) => ({
+        ...prev,
+        indexStatus: "indexing",
+        indexError: null,
+      }));
+
+      const started = performance.now();
+      try {
+        const index =
+          kind === "full"
+            ? await buildFullWorkbookIndex(workbookId)
+            : await updateIndexForDirtyRanges(workbookId, dirtyRanges);
+        setState((prev) => ({
+          ...prev,
+          indexStatus: "ready",
+          indexError: null,
+          indexUpdatedAt: index.updatedAt,
+          indexBlockCount: index.blockCount,
+        }));
+
+        console.log("[Index] Job complete", {
+          kind,
+          blocks: index.blockCount,
+          durationMs: Math.round(performance.now() - started),
+        });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to index workbook";
+        console.error("[Index] Job failed:", err);
+        setState((prev) => ({
+          ...prev,
+          indexStatus: prev.indexStatus === "ready" ? "stale" : "error",
+          indexError: message,
+        }));
+      } finally {
+        isIndexingRef.current = false;
+
+        if (forceFullIndexRef.current) {
+          forceFullIndexRef.current = false;
+          void runWorkbookIndexJob("full");
+        } else if (pendingDirtyRangesRef.current.length > 0) {
+          const merged = mergeRanges(pendingDirtyRangesRef.current);
+          pendingDirtyRangesRef.current = [];
+          void runWorkbookIndexJob("dirty", merged);
+        }
+      }
+    },
+    [],
+  );
+
+  const refreshWorkbookIndex = useCallback(async () => {
+    await runWorkbookIndexJob("full");
+  }, [runWorkbookIndexJob]);
 
   const handleAgentEvent = useCallback(
     (event: AgentEvent) => {
@@ -535,8 +640,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             resultText = JSON.stringify(event.result, null, 2);
           }
 
+          const dirtyRanges = !event.isError
+            ? parseDirtyRanges(resultText)
+            : null;
+
           if (!event.isError && followModeRef.current) {
-            const dirtyRanges = parseDirtyRanges(resultText);
             if (dirtyRanges && dirtyRanges.length > 0) {
               const first = dirtyRanges[0];
               if (first.sheetId >= 0 && first.range !== "*") {
@@ -550,6 +658,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
                 });
               }
             }
+          }
+
+          if (!event.isError && dirtyRanges && dirtyRanges.length > 0) {
+            void runWorkbookIndexJob("dirty", dirtyRanges);
           }
 
           setState((prev) => {
@@ -588,7 +700,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
       }
     },
-    [syncCanonicalState],
+    [syncCanonicalState, runWorkbookIndexJob],
   );
 
   const configRef = useRef<ProviderConfig | null>(null);
@@ -742,11 +854,27 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       try {
         let promptContent = content;
+        let indexContextSection = "";
+        let wbContextSection = "";
+        if (workbookIdRef.current && indexingEnabledRef.current) {
+          try {
+            const indexContext = await buildIndexPromptContext(
+              workbookIdRef.current,
+              content,
+            );
+            if (indexContext) {
+              indexContextSection = `<wb_index_context>\n${indexContext}\n</wb_index_context>\n\n`;
+            }
+          } catch (err) {
+            console.warn("[Chat] Failed to query workbook index:", err);
+          }
+        }
+
         try {
           console.log("[Chat] Fetching workbook metadata...");
           const metadata = await getWorkbookMetadata();
           console.log("[Chat] Workbook metadata:", metadata);
-          promptContent = `<wb_context>\n${JSON.stringify(metadata, null, 2)}\n</wb_context>\n\n${content}`;
+          wbContextSection = `<wb_context>\n${JSON.stringify(metadata, null, 2)}\n</wb_context>\n\n`;
 
           if (metadata.sheetsMetadata) {
             const newSheetNames: Record<number, string> = {};
@@ -758,6 +886,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         } catch (err) {
           console.error("[Chat] Failed to get workbook metadata:", err);
         }
+
+        promptContent = `${indexContextSection}${wbContextSection}${content}`;
 
         // Add attachments section if files are uploaded
         if (attachments && attachments.length > 0) {
@@ -979,6 +1109,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         workbookIdRef.current = id;
         console.log("[Chat] Workbook ID:", id);
 
+        const existingIndex = await loadWorkbookIndex(id);
+        setState((prev) => ({
+          ...prev,
+          indexStatus: existingIndex ? "ready" : "idle",
+          indexError: null,
+          indexUpdatedAt: existingIndex?.updatedAt ?? null,
+          indexBlockCount: existingIndex?.blockCount ?? 0,
+        }));
+
         // Load skills into VFS cache BEFORE applyConfig so the system prompt includes them
         const skills = await getInstalledSkills();
         skillsRef.current = skills;
@@ -1037,11 +1176,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           skills,
           uploads: uploadNames.map((name) => ({ name, size: 0 })),
         }));
+
+        void runWorkbookIndexJob("full");
       })
       .catch((err) => {
         console.error("[Chat] Failed to load session:", err);
       });
-  }, [applyConfig, buildCanonicalState]);
+  }, [applyConfig, buildCanonicalState, runWorkbookIndexJob]);
 
   const getSheetName = useCallback(
     (sheetId: number): string | undefined => state.sheetNames[sheetId],
@@ -1185,6 +1326,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         removeUpload,
         installSkill,
         uninstallSkill,
+        refreshWorkbookIndex,
       }}
     >
       {children}

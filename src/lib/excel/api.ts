@@ -566,6 +566,60 @@ export interface SetCellRangeResult {
   messages?: string[];
 }
 
+export interface ExistingCellFormatting {
+  bold: boolean | null;
+  italic: boolean | null;
+  underline: string | null;
+  strikethrough: boolean | null;
+  fontColor: string | null;
+  fillColor: string | null;
+  numberFormat: string | null;
+  borderStyles: string[];
+}
+
+function normalizeColor(color: string | null): string {
+  if (!color) return "";
+  return color.replace("#", "").trim().toUpperCase();
+}
+
+export function hasNonDefaultCellFormatting(
+  formatting: ExistingCellFormatting,
+): boolean {
+  if (formatting.bold === true) return true;
+  if (formatting.italic === true) return true;
+  if (formatting.strikethrough === true) return true;
+  if (
+    formatting.underline &&
+    formatting.underline.toLowerCase() !== "none" &&
+    formatting.underline.toLowerCase() !== "null"
+  ) {
+    return true;
+  }
+
+  const fillColor = normalizeColor(formatting.fillColor);
+  if (fillColor && fillColor !== "FFFFFF") return true;
+
+  const fontColor = normalizeColor(formatting.fontColor);
+  if (fontColor && fontColor !== "000000") return true;
+
+  if (
+    formatting.numberFormat &&
+    formatting.numberFormat !== "General" &&
+    formatting.numberFormat !== "@"
+  ) {
+    return true;
+  }
+
+  for (const borderStyle of formatting.borderStyles) {
+    const normalized = borderStyle.toLowerCase();
+    if (normalized && normalized !== "none" && normalized !== "null") {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export async function setCellRange(
   sheetId: number,
   rangeAddr: string,
@@ -575,9 +629,16 @@ export async function setCellRange(
     resizeWidth?: { type: "points" | "standard"; value: number };
     resizeHeight?: { type: "points" | "standard"; value: number };
     allowOverwrite?: boolean;
+    allowFormatOverwrite?: boolean;
   } = {},
 ): Promise<SetCellRangeResult> {
-  const { copyToRange, resizeWidth, resizeHeight, allowOverwrite } = options;
+  const {
+    copyToRange,
+    resizeWidth,
+    resizeHeight,
+    allowOverwrite,
+    allowFormatOverwrite,
+  } = options;
 
   return Excel.run(async (context) => {
     const sheet = await getWorksheetById(context, sheetId);
@@ -630,6 +691,73 @@ export async function setCellRange(
         throw new Error(
           `Would overwrite ${nonEmptyCells.length} non-empty cell(s): ${cellList}. ` +
             `To proceed with overwriting existing data, retry with allow_overwrite set to true.`,
+        );
+      }
+    }
+
+    const styleTargets: { r: number; c: number }[] = [];
+    for (let r = 0; r < cells.length; r++) {
+      for (let c = 0; c < cells[r].length; c++) {
+        const cell = cells[r][c];
+        if (cell?.cellStyles || cell?.borderStyles) {
+          styleTargets.push({ r, c });
+        }
+      }
+    }
+
+    if (!allowFormatOverwrite && styleTargets.length > 0) {
+      const borderIndices = [
+        Excel.BorderIndex.edgeTop,
+        Excel.BorderIndex.edgeBottom,
+        Excel.BorderIndex.edgeLeft,
+        Excel.BorderIndex.edgeRight,
+      ];
+      const targetCells = styleTargets.map(({ r, c }) => {
+        const cellRange = range.getCell(r, c);
+        cellRange.load("numberFormat");
+        cellRange.format.font.load("bold,italic,underline,strikethrough,color");
+        cellRange.format.fill.load("color");
+        for (const index of borderIndices) {
+          cellRange.format.borders.getItem(index).load("style");
+        }
+        return { r, c, cellRange };
+      });
+      await context.sync();
+
+      const formattedCells: string[] = [];
+      const { startCol, startRow } = parseRangeAddress(range.address);
+      for (const target of targetCells) {
+        const numberFormat = Array.isArray(target.cellRange.numberFormat)
+          ? target.cellRange.numberFormat[0]?.[0]
+          : null;
+        const existingFormatting: ExistingCellFormatting = {
+          bold: target.cellRange.format.font.bold,
+          italic: target.cellRange.format.font.italic,
+          underline: String(target.cellRange.format.font.underline || "None"),
+          strikethrough: target.cellRange.format.font.strikethrough,
+          fontColor: target.cellRange.format.font.color || null,
+          fillColor: target.cellRange.format.fill.color || null,
+          numberFormat: numberFormat ? String(numberFormat) : null,
+          borderStyles: borderIndices.map((index) =>
+            String(target.cellRange.format.borders.getItem(index).style || ""),
+          ),
+        };
+
+        if (hasNonDefaultCellFormatting(existingFormatting)) {
+          formattedCells.push(
+            cellAddress(startRow + target.r, startCol + target.c),
+          );
+        }
+      }
+
+      if (formattedCells.length > 0) {
+        const cellList =
+          formattedCells.length <= 10
+            ? formattedCells.join(", ")
+            : `${formattedCells.slice(0, 10).join(", ")}...`;
+        throw new Error(
+          `Would overwrite formatting in ${formattedCells.length} cell(s): ${cellList}. ` +
+            `To proceed with overwriting existing formatting, retry with allow_format_overwrite set to true.`,
         );
       }
     }

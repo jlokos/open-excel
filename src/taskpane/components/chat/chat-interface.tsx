@@ -6,6 +6,7 @@ import {
   MessageSquare,
   Moon,
   Plus,
+  RefreshCw,
   Settings,
   Sun,
   Trash2,
@@ -297,8 +298,23 @@ function ChatHeader({
   theme: Theme;
   onThemeToggle: () => void;
 }) {
-  const { clearMessages, state, toggleFollowMode } = useChat();
+  const { clearMessages, state, toggleFollowMode, refreshWorkbookIndex } =
+    useChat();
   const followMode = state.providerConfig?.followMode ?? true;
+  const indexStatusLabel: Record<typeof state.indexStatus, string> = {
+    idle: "index idle",
+    indexing: "indexing",
+    ready: `index ${state.indexBlockCount}`,
+    stale: "index stale",
+    error: "index error",
+  };
+  const indexStatusClass: Record<typeof state.indexStatus, string> = {
+    idle: "text-(--chat-text-muted)",
+    indexing: "text-(--chat-accent)",
+    ready: "text-(--chat-text-secondary)",
+    stale: "text-(--chat-text-primary)",
+    error: "text-(--chat-error)",
+  };
 
   return (
     <div className="border-b border-(--chat-border) bg-(--chat-bg)">
@@ -321,6 +337,38 @@ function ChatHeader({
           </TabButton>
         </div>
         <div className="flex items-center">
+          {activeTab === "chat" && (
+            <>
+              <span
+                className={`text-[10px] uppercase tracking-wider px-1.5 ${indexStatusClass[state.indexStatus]}`}
+                title={
+                  state.indexError ||
+                  (state.indexUpdatedAt
+                    ? `Updated ${new Date(state.indexUpdatedAt).toLocaleTimeString()}`
+                    : "Workbook style index status")
+                }
+                style={{ fontFamily: "var(--chat-font-mono)" }}
+              >
+                {indexStatusLabel[state.indexStatus]}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  void refreshWorkbookIndex();
+                }}
+                disabled={state.indexStatus === "indexing"}
+                className="p-1.5 text-(--chat-text-muted) hover:text-(--chat-text-primary) disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                title="Refresh workbook index"
+              >
+                <RefreshCw
+                  size={14}
+                  className={
+                    state.indexStatus === "indexing" ? "animate-spin" : ""
+                  }
+                />
+              </button>
+            </>
+          )}
           {activeTab === "chat" && (
             <button
               type="button"

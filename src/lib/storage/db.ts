@@ -26,6 +26,26 @@ export interface SkillFile {
   data: Uint8Array;
 }
 
+export interface StoredIndexBlock {
+  blockId: string;
+  sheetId: number;
+  sheetName: string;
+  range: string;
+  descriptor: string;
+  stats: Record<string, unknown>;
+  vector: ArrayBuffer;
+}
+
+export interface WorkbookIndexRecord {
+  workbookId: string;
+  modelId: string;
+  indexVersion: number;
+  createdAt: number;
+  updatedAt: number;
+  blockCount: number;
+  blocks: StoredIndexBlock[];
+}
+
 interface OpenExcelSchema extends DBSchema {
   sessions: {
     key: string;
@@ -42,11 +62,16 @@ interface OpenExcelSchema extends DBSchema {
     value: SkillFile;
     indexes: { skillName: string };
   };
+  workbookIndexes: {
+    key: string;
+    value: WorkbookIndexRecord;
+    indexes: { updatedAt: number };
+  };
 }
 
 let dbPromise: Promise<IDBPDatabase<OpenExcelSchema>> | null = null;
 const DB_NAME = "OpenExcelDB_v3";
-const MIN_DB_VERSION = 30;
+const MIN_DB_VERSION = 31;
 
 function isVersionError(error: unknown): boolean {
   return (
@@ -61,6 +86,7 @@ function hasRequiredSchema(db: IDBPDatabase<OpenExcelSchema>): boolean {
   if (!db.objectStoreNames.contains("sessions")) return false;
   if (!db.objectStoreNames.contains("vfsFiles")) return false;
   if (!db.objectStoreNames.contains("skillFiles")) return false;
+  if (!db.objectStoreNames.contains("workbookIndexes")) return false;
 
   const sessions = db.transaction("sessions", "readonly").store;
   if (!sessions.indexNames.contains("workbookId")) return false;
@@ -70,7 +96,10 @@ function hasRequiredSchema(db: IDBPDatabase<OpenExcelSchema>): boolean {
   if (!vfsFiles.indexNames.contains("sessionId")) return false;
 
   const skillFiles = db.transaction("skillFiles", "readonly").store;
-  return skillFiles.indexNames.contains("skillName");
+  if (!skillFiles.indexNames.contains("skillName")) return false;
+
+  const workbookIndexes = db.transaction("workbookIndexes", "readonly").store;
+  return workbookIndexes.indexNames.contains("updatedAt");
 }
 
 function openDbAtVersion(
@@ -101,6 +130,13 @@ function openDbAtVersion(
       if (!skillFiles.indexNames.contains("skillName")) {
         skillFiles.createIndex("skillName", "skillName");
       }
+
+      const workbookIndexes = db.objectStoreNames.contains("workbookIndexes")
+        ? transaction.objectStore("workbookIndexes")
+        : db.createObjectStore("workbookIndexes", { keyPath: "workbookId" });
+      if (!workbookIndexes.indexNames.contains("updatedAt")) {
+        workbookIndexes.createIndex("updatedAt", "updatedAt");
+      }
     },
   });
 }
@@ -108,7 +144,7 @@ function openDbAtVersion(
 async function openDbWithFallback(): Promise<IDBPDatabase<OpenExcelSchema>> {
   try {
     // Dexie used version(3) which maps to IndexedDB version 30.
-    // Open at >=30 for compatibility with old data.
+    // Open at >=31 to include workbookIndexes while preserving compatibility.
     return await openDbAtVersion(MIN_DB_VERSION);
   } catch (error) {
     if (!isVersionError(error)) {
@@ -384,4 +420,23 @@ export async function listSkillNames(): Promise<string[]> {
   const rows = await db.getAll("skillFiles");
   const names = new Set(rows.map((r) => r.skillName));
   return [...names].sort();
+}
+
+export async function saveWorkbookIndex(
+  record: WorkbookIndexRecord,
+): Promise<void> {
+  const db = await getDb();
+  await db.put("workbookIndexes", record);
+}
+
+export async function loadWorkbookIndex(
+  workbookId: string,
+): Promise<WorkbookIndexRecord | undefined> {
+  const db = await getDb();
+  return db.get("workbookIndexes", workbookId);
+}
+
+export async function deleteWorkbookIndex(workbookId: string): Promise<void> {
+  const db = await getDb();
+  await db.delete("workbookIndexes", workbookId);
 }

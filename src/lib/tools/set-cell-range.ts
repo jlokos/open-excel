@@ -86,6 +86,8 @@ export const setCellRangeTool = defineTool({
     "OVERWRITE PROTECTION: By default, fails if target cells contain data. " +
     "If the tool returns an overwrite error, read those cells to see what's there, " +
     "confirm with the user, then retry with allow_overwrite=true. " +
+    "Formatting overwrite protection is also enabled: if existing formatting would be replaced, " +
+    "confirm with the user, then retry with allow_format_overwrite=true. " +
     "Only set allow_overwrite=true on first attempt if user explicitly says 'replace' or 'overwrite'. " +
     "Use copyToRange to expand a pattern to a larger area.",
   parameters: Type.Object({
@@ -106,6 +108,11 @@ export const setCellRangeTool = defineTool({
     resizeHeight: ResizeSchema,
     allow_overwrite: Type.Optional(
       Type.Boolean({ description: "Confirm overwriting existing data" }),
+    ),
+    allow_format_overwrite: Type.Optional(
+      Type.Boolean({
+        description: "Confirm overwriting existing formatting",
+      }),
     ),
     explanation: Type.Optional(
       Type.String({
@@ -134,6 +141,7 @@ export const setCellRangeTool = defineTool({
           resizeWidth: params.resizeWidth,
           resizeHeight: params.resizeHeight,
           allowOverwrite: params.allow_overwrite,
+          allowFormatOverwrite: params.allow_format_overwrite,
         },
       );
       return toolSuccess(result);

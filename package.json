@@ -30,6 +30,7 @@
     "watch": "vite build --mode development --watch"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
     "@mariozechner/pi-agent-core": "^0.54.0",
     "@mariozechner/pi-ai": "^0.54.0",
     "@mozilla/readability": "^0.6.0",
@@ -57,6 +58,7 @@
     "@types/react-dom": "^18.2.21",
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.24",
+    "fake-indexeddb": "^6.2.5",
     "office-addin-cli": "^2.0.3",
     "office-addin-debugging": "^6.0.3",
     "office-addin-dev-certs": "^2.0.3",

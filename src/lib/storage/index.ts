@@ -1,9 +1,15 @@
-export type { ChatSession, SkillFile } from "./db";
+export type {
+  ChatSession,
+  SkillFile,
+  StoredIndexBlock,
+  WorkbookIndexRecord,
+} from "./db";
 export {
   createSession,
   deleteSession,
   deleteSkillFiles,
   deleteVfsFiles,
+  deleteWorkbookIndex,
   getOrCreateCurrentSession,
   getOrCreateWorkbookId,
   getSession,
@@ -13,8 +19,10 @@ export {
   loadAllSkillFiles,
   loadSkillFiles,
   loadVfsFiles,
+  loadWorkbookIndex,
   renameSession,
   saveSession,
   saveSkillFiles,
   saveVfsFiles,
+  saveWorkbookIndex,
 } from "./db";
