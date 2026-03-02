@@ -39,7 +39,8 @@ export const getRangeAsCsvTool = defineTool({
       });
       return toolSuccess(result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error reading CSV";
+      const message =
+        error instanceof Error ? error.message : "Unknown error reading CSV";
       return toolError(message);
     }
   },

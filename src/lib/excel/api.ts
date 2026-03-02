@@ -1,5 +1,8 @@
 /* global Excel */
 
+import { createSearchPageCollector } from "./search-data-pagination";
+import { getStableSheetId, preloadSheetIds } from "./sheet-id-map";
+
 export interface CellData {
   value: string | number | boolean | null;
   formula?: string;
@@ -44,20 +47,51 @@ function cellAddress(rowIndex: number, colIndex: number): string {
   return `${columnIndexToLetter(colIndex)}${rowIndex + 1}`;
 }
 
-function parseRangeAddress(address: string): { startCol: number; startRow: number } {
+function parseRangeAddress(address: string): {
+  startCol: number;
+  startRow: number;
+} {
   const clean = address.split("!").pop()?.split(":")[0] || "A1";
   const match = clean.match(/([A-Z]+)(\d+)/);
   if (!match) return { startCol: 0, startRow: 0 };
-  const col = match[1].split("").reduce((acc, c) => acc * 26 + c.charCodeAt(0) - 64, 0) - 1;
+  const col =
+    match[1].split("").reduce((acc, c) => acc * 26 + c.charCodeAt(0) - 64, 0) -
+    1;
   const row = Number.parseInt(match[2], 10) - 1;
   return { startCol: col, startRow: row };
 }
 
-function excelColorToHex(color: Excel.RangeFont | Excel.RangeFill): string | undefined {
+function excelColorToHex(
+  color: Excel.RangeFont | Excel.RangeFill,
+): string | undefined {
   const c = color as { color?: string };
   if (!c.color || c.color === "null") return undefined;
   if (c.color.startsWith("#")) return c.color.toUpperCase();
   return c.color;
+}
+
+async function getPointsPerStandardColumnWidth(
+  context: Excel.RequestContext,
+  sheet: Excel.Worksheet,
+): Promise<number> {
+  const probe = sheet.getRange("XFD:XFD");
+  probe.format.load("columnWidth");
+  sheet.load("standardWidth");
+  await context.sync();
+
+  const originalWidth = probe.format.columnWidth;
+  probe.format.useStandardWidth = true;
+  probe.format.load("columnWidth");
+  await context.sync();
+
+  const standardWidthPoints = probe.format.columnWidth;
+  probe.format.columnWidth = originalWidth;
+  await context.sync();
+
+  if (sheet.standardWidth && standardWidthPoints) {
+    return standardWidthPoints / sheet.standardWidth;
+  }
+  return 1;
 }
 
 export async function getWorksheetById(
@@ -69,22 +103,29 @@ export async function getWorksheetById(
   await context.sync();
 
   for (const sheet of sheets.items) {
-    sheet.load("id,name");
+    sheet.load("id");
   }
   await context.sync();
 
+  const idMap = await preloadSheetIds(sheets.items);
+
   for (const sheet of sheets.items) {
-    const numericId = Number.parseInt(sheet.id.replace(/\D/g, ""), 10);
-    if (numericId === sheetId || sheet.id === String(sheetId)) {
+    const stableId = idMap.get(sheet.id);
+    if (stableId === sheetId) {
       return sheet;
     }
   }
 
-  if (sheetId >= 1 && sheetId <= sheets.items.length) {
-    return sheets.items[sheetId - 1];
-  }
-
   return null;
+}
+
+export async function getWorksheetStableId(
+  context: Excel.RequestContext,
+  sheet: Excel.Worksheet,
+): Promise<number> {
+  sheet.load("id");
+  await context.sync();
+  return getStableSheetId(sheet.id);
 }
 
 export async function getCellRanges(
@@ -105,7 +146,9 @@ export async function getCellRanges(
     usedRange.load("address");
     await context.sync();
 
-    const dimension = usedRange.isNullObject ? "A1" : usedRange.address.split("!")[1] || "A1";
+    const dimension = usedRange.isNullObject
+      ? "A1"
+      : usedRange.address.split("!")[1] || "A1";
 
     const cells: Record<string, string | number | boolean | null> = {};
     const formulas: Record<string, string> = {};
@@ -121,21 +164,18 @@ export async function getCellRanges(
 
       const range = sheet.getRange(rangeAddr);
       range.load("values,formulas,address,rowCount,columnCount");
-
-      if (includeStyles) {
-        range.load("format/font,format/fill");
-        range.format.font.load("name,size,color,bold,italic");
-        range.format.fill.load("color");
-      }
-
       await context.sync();
 
       const startAddress = range.address.split("!")[1]?.split(":")[0] || "A1";
       const startMatch = startAddress.match(/([A-Z]+)(\d+)/);
       const startCol = startMatch
-        ? startMatch[1].split("").reduce((acc, c) => acc * 26 + c.charCodeAt(0) - 64, 0) - 1
+        ? startMatch[1]
+            .split("")
+            .reduce((acc, c) => acc * 26 + c.charCodeAt(0) - 64, 0) - 1
         : 0;
       const startRow = startMatch ? Number.parseInt(startMatch[2], 10) - 1 : 0;
+
+      const styleTargetsMap = new Map<string, Excel.Range>();
 
       for (let r = 0; r < range.rowCount && totalCells < cellLimit; r++) {
         for (let c = 0; c < range.columnCount && totalCells < cellLimit; c++) {
@@ -146,44 +186,59 @@ export async function getCellRanges(
           if (value !== null && value !== "" && value !== undefined) {
             cells[addr] = value as string | number | boolean;
             totalCells++;
+            if (includeStyles) {
+              styleTargetsMap.set(addr, range.getCell(r, c));
+            }
           }
 
           if (typeof formula === "string" && formula.startsWith("=")) {
             formulas[addr] = formula;
+            if (includeStyles) {
+              styleTargetsMap.set(addr, range.getCell(r, c));
+            }
           }
         }
       }
 
-      if (includeStyles && range.format) {
-        const rangeStyle: CellStyle = {};
-        const font = range.format.font;
-        const fill = range.format.fill;
+      if (includeStyles && styleTargetsMap.size > 0) {
+        const styleTargets = Array.from(styleTargetsMap.entries());
+        for (const [, cell] of styleTargets) {
+          cell.format.font.load("name,size,color,bold,italic");
+          cell.format.fill.load("color");
+        }
+        await context.sync();
 
-        if (font.size) rangeStyle.sz = font.size;
-        if (font.name) rangeStyle.family = font.name;
-        if (font.bold) rangeStyle.bold = font.bold;
-        if (font.italic) rangeStyle.italic = font.italic;
+        for (const [addr, cell] of styleTargets) {
+          const rangeStyle: CellStyle = {};
+          const font = cell.format.font;
+          const fill = cell.format.fill;
 
-        const fontColor = excelColorToHex(font as Excel.RangeFont);
-        if (fontColor) rangeStyle.color = fontColor;
+          if (font.size) rangeStyle.sz = font.size;
+          if (font.name) rangeStyle.family = font.name;
+          if (font.bold !== null && font.bold !== undefined)
+            rangeStyle.bold = font.bold;
+          if (font.italic !== null && font.italic !== undefined)
+            rangeStyle.italic = font.italic;
 
-        const fillColor = excelColorToHex(fill as Excel.RangeFill);
-        if (fillColor) rangeStyle.fgColor = fillColor;
+          const fontColor = excelColorToHex(font as Excel.RangeFont);
+          if (fontColor) rangeStyle.color = fontColor;
 
-        if (Object.keys(rangeStyle).length > 0) {
-          styles[rangeAddr] = rangeStyle;
+          const fillColor = excelColorToHex(fill as Excel.RangeFill);
+          if (fillColor) rangeStyle.fgColor = fillColor;
+
+          if (Object.keys(rangeStyle).length > 0) {
+            styles[addr] = rangeStyle;
+          }
         }
       }
     }
-
-    const sheetNumericId = Number.parseInt(sheet.id.replace(/\D/g, ""), 10) || sheetId;
 
     return {
       success: true,
       hasMore,
       worksheet: {
         name: sheet.name,
-        sheetId: sheetNumericId,
+        sheetId,
         dimension,
         cells,
         ...(Object.keys(formulas).length > 0 && { formulas }),
@@ -299,67 +354,103 @@ export async function searchData(
     sheets.load("items");
     await context.sync();
 
-    const matches: SearchMatch[] = [];
+    for (const sheet of sheets.items) {
+      sheet.load("id");
+    }
+    await context.sync();
+
+    const stableIdMap = await preloadSheetIds(sheets.items);
+
+    const pageCollector = createSearchPageCollector<SearchMatch>(
+      offset,
+      maxResults,
+    );
+
+    let stopSearch = false;
+
     const sheetsToSearch = sheetId
-      ? ([await getWorksheetById(context, sheetId)].filter(Boolean) as Excel.Worksheet[])
+      ? ([await getWorksheetById(context, sheetId)].filter(
+          Boolean,
+        ) as Excel.Worksheet[])
       : sheets.items;
 
-    const pattern = useRegex ? new RegExp(searchTerm, matchCase ? "" : "i") : null;
+    const pattern = useRegex
+      ? new RegExp(searchTerm, matchCase ? "" : "i")
+      : null;
 
     for (const sheet of sheetsToSearch) {
+      if (stopSearch) break;
+
       sheet.load("name,id");
-      const searchRange = range ? sheet.getRange(range) : sheet.getUsedRangeOrNullObject();
+      const searchRange = range
+        ? sheet.getRange(range)
+        : sheet.getUsedRangeOrNullObject();
       searchRange.load("values,formulas,address,rowCount,columnCount");
       await context.sync();
 
       if (searchRange.isNullObject) continue;
 
       const { startCol, startRow } = parseRangeAddress(searchRange.address);
+      const stableSheetId =
+        stableIdMap.get(sheet.id) || (await getStableSheetId(sheet.id));
 
-      for (let r = 0; r < searchRange.rowCount; r++) {
+      for (let r = 0; r < searchRange.rowCount && !stopSearch; r++) {
         for (let c = 0; c < searchRange.columnCount; c++) {
-          if (matches.length >= offset + maxResults) break;
-
           const value = searchRange.values[r][c];
           const formula = searchRange.formulas[r][c];
-          const searchTarget = matchFormulas && formula ? String(formula) : String(value ?? "");
+          const searchTarget =
+            matchFormulas && formula ? String(formula) : String(value ?? "");
 
           let isMatch = false;
           if (pattern) {
             isMatch = pattern.test(searchTarget);
           } else {
-            const compareVal = matchCase ? searchTarget : searchTarget.toLowerCase();
-            const compareTerm = matchCase ? searchTerm : searchTerm.toLowerCase();
-            isMatch = matchEntireCell ? compareVal === compareTerm : compareVal.includes(compareTerm);
+            const compareVal = matchCase
+              ? searchTarget
+              : searchTarget.toLowerCase();
+            const compareTerm = matchCase
+              ? searchTerm
+              : searchTerm.toLowerCase();
+            isMatch = matchEntireCell
+              ? compareVal === compareTerm
+              : compareVal.includes(compareTerm);
           }
 
-          if (isMatch && matches.length >= offset) {
-            const sheetNumericId = Number.parseInt(sheet.id.replace(/\D/g, ""), 10);
-            matches.push({
-              sheetName: sheet.name,
-              sheetId: sheetNumericId,
-              a1: cellAddress(startRow + r, startCol + c),
-              value: value as string | number | boolean,
-              formula: typeof formula === "string" && formula.startsWith("=") ? formula : null,
-              row: startRow + r + 1,
-              column: startCol + c + 1,
-            });
+          if (!isMatch) continue;
+
+          const shouldStop = pageCollector.add({
+            sheetName: sheet.name,
+            sheetId: stableSheetId,
+            a1: cellAddress(startRow + r, startCol + c),
+            value: value as string | number | boolean,
+            formula:
+              typeof formula === "string" && formula.startsWith("=")
+                ? formula
+                : null,
+            row: startRow + r + 1,
+            column: startCol + c + 1,
+          });
+
+          if (shouldStop) {
+            stopSearch = true;
+            break;
           }
         }
       }
     }
 
-    const returned = matches.slice(0, maxResults);
+    const page = pageCollector.toPage();
+
     return {
       success: true,
-      matches: returned,
-      totalFound: matches.length + offset,
-      returned: returned.length,
-      offset,
-      hasMore: matches.length > maxResults,
+      matches: pageCollector.matches,
+      totalFound: page.totalFound,
+      returned: page.returned,
+      offset: page.offset,
+      hasMore: page.hasMore,
       searchTerm,
       searchScope: sheetId ? `Sheet ${sheetId}` : "All sheets",
-      nextOffset: matches.length > maxResults ? offset + maxResults : null,
+      nextOffset: page.nextOffset,
     };
   });
 }
@@ -377,7 +468,9 @@ export interface GetAllObjectsResult {
   objects: ExcelObject[];
 }
 
-export async function getAllObjects(options: { sheetId?: number; id?: string } = {}): Promise<GetAllObjectsResult> {
+export async function getAllObjects(
+  options: { sheetId?: number; id?: string } = {},
+): Promise<GetAllObjectsResult> {
   const { sheetId, id } = options;
 
   return Excel.run(async (context) => {
@@ -385,9 +478,18 @@ export async function getAllObjects(options: { sheetId?: number; id?: string } =
     sheets.load("items");
     await context.sync();
 
+    for (const sheet of sheets.items) {
+      sheet.load("id");
+    }
+    await context.sync();
+
+    const stableIdMap = await preloadSheetIds(sheets.items);
+
     const objects: ExcelObject[] = [];
     const sheetsToCheck = sheetId
-      ? ([await getWorksheetById(context, sheetId)].filter(Boolean) as Excel.Worksheet[])
+      ? ([await getWorksheetById(context, sheetId)].filter(
+          Boolean,
+        ) as Excel.Worksheet[])
       : sheets.items;
 
     for (const sheet of sheetsToCheck) {
@@ -398,7 +500,8 @@ export async function getAllObjects(options: { sheetId?: number; id?: string } =
       pivotTables.load("items");
       await context.sync();
 
-      const sheetNumericId = Number.parseInt(sheet.id.replace(/\D/g, ""), 10);
+      const stableSheetId =
+        stableIdMap.get(sheet.id) || (await getStableSheetId(sheet.id));
 
       for (const chart of charts.items) {
         chart.load("id,name");
@@ -408,7 +511,7 @@ export async function getAllObjects(options: { sheetId?: number; id?: string } =
             id: chart.id,
             type: "chart",
             name: chart.name,
-            sheetId: sheetNumericId,
+            sheetId: stableSheetId,
             sheetName: sheet.name,
           });
         }
@@ -422,7 +525,7 @@ export async function getAllObjects(options: { sheetId?: number; id?: string } =
             id: pivot.id,
             type: "pivotTable",
             name: pivot.name,
-            sheetId: sheetNumericId,
+            sheetId: stableSheetId,
             sheetName: sheet.name,
           });
         }
@@ -460,6 +563,61 @@ export interface SetCellRangeResult {
   success: boolean;
   cellsWritten: number;
   formulaResults?: Record<string, unknown>;
+  messages?: string[];
+}
+
+export interface ExistingCellFormatting {
+  bold: boolean | null;
+  italic: boolean | null;
+  underline: string | null;
+  strikethrough: boolean | null;
+  fontColor: string | null;
+  fillColor: string | null;
+  numberFormat: string | null;
+  borderStyles: string[];
+}
+
+function normalizeColor(color: string | null): string {
+  if (!color) return "";
+  return color.replace("#", "").trim().toUpperCase();
+}
+
+export function hasNonDefaultCellFormatting(
+  formatting: ExistingCellFormatting,
+): boolean {
+  if (formatting.bold === true) return true;
+  if (formatting.italic === true) return true;
+  if (formatting.strikethrough === true) return true;
+  if (
+    formatting.underline &&
+    formatting.underline.toLowerCase() !== "none" &&
+    formatting.underline.toLowerCase() !== "null"
+  ) {
+    return true;
+  }
+
+  const fillColor = normalizeColor(formatting.fillColor);
+  if (fillColor && fillColor !== "FFFFFF") return true;
+
+  const fontColor = normalizeColor(formatting.fontColor);
+  if (fontColor && fontColor !== "000000") return true;
+
+  if (
+    formatting.numberFormat &&
+    formatting.numberFormat !== "General" &&
+    formatting.numberFormat !== "@"
+  ) {
+    return true;
+  }
+
+  for (const borderStyle of formatting.borderStyles) {
+    const normalized = borderStyle.toLowerCase();
+    if (normalized && normalized !== "none" && normalized !== "null") {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export async function setCellRange(
@@ -471,17 +629,40 @@ export async function setCellRange(
     resizeWidth?: { type: "points" | "standard"; value: number };
     resizeHeight?: { type: "points" | "standard"; value: number };
     allowOverwrite?: boolean;
+    allowFormatOverwrite?: boolean;
   } = {},
 ): Promise<SetCellRangeResult> {
-  const { copyToRange, resizeWidth, resizeHeight, allowOverwrite } = options;
+  const {
+    copyToRange,
+    resizeWidth,
+    resizeHeight,
+    allowOverwrite,
+    allowFormatOverwrite,
+  } = options;
 
   return Excel.run(async (context) => {
     const sheet = await getWorksheetById(context, sheetId);
     if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
 
-    const range = sheet.getRange(rangeAddr);
+    const messages: string[] = [];
+    let range = sheet.getRange(rangeAddr);
     range.load("rowCount,columnCount,values,formulas,address");
     await context.sync();
+
+    const inputRows = cells.length;
+    const inputCols = Math.max(...cells.map((r) => r.length));
+    if (inputRows !== range.rowCount || inputCols !== range.columnCount) {
+      const { startCol, startRow } = parseRangeAddress(range.address);
+      const endRow = startRow + inputRows - 1;
+      const endCol = startCol + inputCols - 1;
+      const newAddr = `${cellAddress(startRow, startCol)}:${cellAddress(endRow, endCol)}`;
+      messages.push(
+        `Adjusted range from ${rangeAddr} to ${newAddr} (row diff: ${inputRows - range.rowCount}, col diff: ${inputCols - range.columnCount})`,
+      );
+      range = sheet.getRange(newAddr);
+      range.load("rowCount,columnCount,values,formulas,address");
+      await context.sync();
+    }
 
     if (!allowOverwrite) {
       const nonEmptyCells: string[] = [];
@@ -491,8 +672,10 @@ export async function setCellRange(
         for (let c = 0; c < range.columnCount; c++) {
           const value = range.values[r][c];
           const formula = range.formulas[r][c];
-          const hasValue = value !== null && value !== "" && value !== undefined;
-          const hasFormula = typeof formula === "string" && formula.startsWith("=");
+          const hasValue =
+            value !== null && value !== "" && value !== undefined;
+          const hasFormula =
+            typeof formula === "string" && formula.startsWith("=");
 
           if (hasValue || hasFormula) {
             nonEmptyCells.push(cellAddress(startRow + r, startCol + c));
@@ -502,10 +685,79 @@ export async function setCellRange(
 
       if (nonEmptyCells.length > 0) {
         const cellList =
-          nonEmptyCells.length <= 10 ? nonEmptyCells.join(", ") : `${nonEmptyCells.slice(0, 10).join(", ")}...`;
+          nonEmptyCells.length <= 10
+            ? nonEmptyCells.join(", ")
+            : `${nonEmptyCells.slice(0, 10).join(", ")}...`;
         throw new Error(
           `Would overwrite ${nonEmptyCells.length} non-empty cell(s): ${cellList}. ` +
             `To proceed with overwriting existing data, retry with allow_overwrite set to true.`,
+        );
+      }
+    }
+
+    const styleTargets: { r: number; c: number }[] = [];
+    for (let r = 0; r < cells.length; r++) {
+      for (let c = 0; c < cells[r].length; c++) {
+        const cell = cells[r][c];
+        if (cell?.cellStyles || cell?.borderStyles) {
+          styleTargets.push({ r, c });
+        }
+      }
+    }
+
+    if (!allowFormatOverwrite && styleTargets.length > 0) {
+      const borderIndices = [
+        Excel.BorderIndex.edgeTop,
+        Excel.BorderIndex.edgeBottom,
+        Excel.BorderIndex.edgeLeft,
+        Excel.BorderIndex.edgeRight,
+      ];
+      const targetCells = styleTargets.map(({ r, c }) => {
+        const cellRange = range.getCell(r, c);
+        cellRange.load("numberFormat");
+        cellRange.format.font.load("bold,italic,underline,strikethrough,color");
+        cellRange.format.fill.load("color");
+        for (const index of borderIndices) {
+          cellRange.format.borders.getItem(index).load("style");
+        }
+        return { r, c, cellRange };
+      });
+      await context.sync();
+
+      const formattedCells: string[] = [];
+      const { startCol, startRow } = parseRangeAddress(range.address);
+      for (const target of targetCells) {
+        const numberFormat = Array.isArray(target.cellRange.numberFormat)
+          ? target.cellRange.numberFormat[0]?.[0]
+          : null;
+        const existingFormatting: ExistingCellFormatting = {
+          bold: target.cellRange.format.font.bold,
+          italic: target.cellRange.format.font.italic,
+          underline: String(target.cellRange.format.font.underline || "None"),
+          strikethrough: target.cellRange.format.font.strikethrough,
+          fontColor: target.cellRange.format.font.color || null,
+          fillColor: target.cellRange.format.fill.color || null,
+          numberFormat: numberFormat ? String(numberFormat) : null,
+          borderStyles: borderIndices.map((index) =>
+            String(target.cellRange.format.borders.getItem(index).style || ""),
+          ),
+        };
+
+        if (hasNonDefaultCellFormatting(existingFormatting)) {
+          formattedCells.push(
+            cellAddress(startRow + target.r, startCol + target.c),
+          );
+        }
+      }
+
+      if (formattedCells.length > 0) {
+        const cellList =
+          formattedCells.length <= 10
+            ? formattedCells.join(", ")
+            : `${formattedCells.slice(0, 10).join(", ")}...`;
+        throw new Error(
+          `Would overwrite formatting in ${formattedCells.length} cell(s): ${cellList}. ` +
+            `To proceed with overwriting existing formatting, retry with allow_format_overwrite set to true.`,
         );
       }
     }
@@ -531,7 +783,9 @@ export async function setCellRange(
     }
 
     if (hasFormulas) {
-      range.formulas = formulas.map((row, r) => row.map((f, c) => f ?? values[r][c]));
+      range.formulas = formulas.map((row, r) =>
+        row.map((f, c) => f ?? values[r][c]),
+      );
     } else {
       range.values = values;
     }
@@ -546,15 +800,27 @@ export async function setCellRange(
         if (cell.cellStyles) {
           const s = cell.cellStyles;
           if (s.fontWeight === "bold") cellRange.format.font.bold = true;
+          if (s.fontWeight === "normal") cellRange.format.font.bold = false;
           if (s.fontStyle === "italic") cellRange.format.font.italic = true;
-          if (s.fontLine === "underline") cellRange.format.font.underline = "Single";
-          if (s.fontLine === "line-through") cellRange.format.font.strikethrough = true;
+          if (s.fontStyle === "normal") cellRange.format.font.italic = false;
+          if (s.fontLine === "underline")
+            cellRange.format.font.underline = "Single";
+          if (s.fontLine === "line-through") {
+            cellRange.format.font.strikethrough = true;
+            cellRange.format.font.underline = "None";
+          }
+          if (s.fontLine === "none") {
+            cellRange.format.font.strikethrough = false;
+            cellRange.format.font.underline = "None";
+          }
           if (s.fontSize) cellRange.format.font.size = s.fontSize;
           if (s.fontFamily) cellRange.format.font.name = s.fontFamily;
           if (s.fontColor) cellRange.format.font.color = s.fontColor;
-          if (s.backgroundColor) cellRange.format.fill.color = s.backgroundColor;
+          if (s.backgroundColor)
+            cellRange.format.fill.color = s.backgroundColor;
           if (s.horizontalAlignment) {
-            cellRange.format.horizontalAlignment = s.horizontalAlignment as Excel.HorizontalAlignment;
+            cellRange.format.horizontalAlignment =
+              s.horizontalAlignment as Excel.HorizontalAlignment;
           }
           if (s.numberFormat) cellRange.numberFormat = [[s.numberFormat]];
         }
@@ -578,7 +844,8 @@ export async function setCellRange(
                 dotted: Excel.BorderLineStyle.dot,
                 double: Excel.BorderLineStyle.double,
               };
-              border.style = styleMap[side.style] ?? Excel.BorderLineStyle.continuous;
+              border.style =
+                styleMap[side.style] ?? Excel.BorderLineStyle.continuous;
             }
             if (side.weight) {
               const weightMap: Record<string, Excel.BorderWeight> = {
@@ -597,6 +864,8 @@ export async function setCellRange(
         if (cell.note) {
           cellRange.load("address");
           await context.sync();
+          const cellAddr = cellRange.address.split("!")[1] || cellRange.address;
+          sheet.notes.add(cellAddr, cell.note);
         }
       }
     }
@@ -611,7 +880,15 @@ export async function setCellRange(
 
     if (resizeWidth) {
       const cols = range.getEntireColumn();
-      cols.format.columnWidth = resizeWidth.value;
+      if (resizeWidth.type === "standard") {
+        const pointsPerStandard = await getPointsPerStandardColumnWidth(
+          context,
+          sheet,
+        );
+        cols.format.columnWidth = resizeWidth.value * pointsPerStandard;
+      } else {
+        cols.format.columnWidth = resizeWidth.value;
+      }
     }
     if (resizeHeight) {
       const rows = range.getEntireRow();
@@ -628,7 +905,8 @@ export async function setCellRange(
       for (let r = 0; r < range.values.length; r++) {
         for (let c = 0; c < range.values[r].length; c++) {
           if (formulas[r]?.[c]) {
-            formulaResults[cellAddress(startRow + r, startCol + c)] = range.values[r][c];
+            formulaResults[cellAddress(startRow + r, startCol + c)] =
+              range.values[r][c];
           }
         }
       }
@@ -638,6 +916,7 @@ export async function setCellRange(
       success: true,
       cellsWritten: cells.flat().length,
       ...(Object.keys(formulaResults).length > 0 && { formulaResults }),
+      ...(messages.length > 0 && { messages }),
     };
   });
 }
@@ -682,7 +961,11 @@ export interface CopyToResult {
   destination: string;
 }
 
-export async function copyTo(sheetId: number, sourceRange: string, destinationRange: string): Promise<CopyToResult> {
+export async function copyTo(
+  sheetId: number,
+  sourceRange: string,
+  destinationRange: string,
+): Promise<CopyToResult> {
   return Excel.run(async (context) => {
     const sheet = await getWorksheetById(context, sheetId);
     if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
@@ -692,7 +975,11 @@ export async function copyTo(sheetId: number, sourceRange: string, destinationRa
     dest.copyFrom(source, Excel.RangeCopyType.all);
     await context.sync();
 
-    return { success: true, source: sourceRange, destination: destinationRange };
+    return {
+      success: true,
+      source: sourceRange,
+      destination: destinationRange,
+    };
   });
 }
 
@@ -711,7 +998,13 @@ export async function modifySheetStructure(
     position?: "before" | "after";
   },
 ): Promise<ModifySheetStructureResult> {
-  const { operation, dimension, reference, count = 1, position = "before" } = params;
+  const {
+    operation,
+    dimension,
+    reference,
+    count = 1,
+    position = "before",
+  } = params;
 
   return Excel.run(async (context) => {
     const sheet = await getWorksheetById(context, sheetId);
@@ -742,7 +1035,9 @@ export async function modifySheetStructure(
 
       switch (operation) {
         case "insert": {
-          const shiftDir = isRow ? Excel.InsertShiftDirection.down : Excel.InsertShiftDirection.right;
+          const shiftDir = isRow
+            ? Excel.InsertShiftDirection.down
+            : Excel.InsertShiftDirection.right;
           if (position === "after") {
             sheet.getRange(afterRangeRef).insert(shiftDir);
           } else {
@@ -751,7 +1046,11 @@ export async function modifySheetStructure(
           break;
         }
         case "delete":
-          targetRange.delete(isRow ? Excel.DeleteShiftDirection.up : Excel.DeleteShiftDirection.left);
+          targetRange.delete(
+            isRow
+              ? Excel.DeleteShiftDirection.up
+              : Excel.DeleteShiftDirection.left,
+          );
           break;
         case "hide":
           if (isRow) {
@@ -809,8 +1108,13 @@ export async function modifyWorkbookStructure(params: {
         if (tabColor) newSheet.tabColor = tabColor;
         newSheet.load("id,name");
         await context.sync();
-        const numericId = Number.parseInt(newSheet.id.replace(/\D/g, ""), 10);
-        return { success: true, operation, sheetId: numericId, sheetName: newSheet.name };
+        const newSheetIndex = await getWorksheetStableId(context, newSheet);
+        return {
+          success: true,
+          operation,
+          sheetId: newSheetIndex,
+          sheetName: newSheet.name,
+        };
       }
       case "delete": {
         const sheet = await getWorksheetById(context, sheetId!);
@@ -833,8 +1137,13 @@ export async function modifyWorkbookStructure(params: {
         if (newName) copy.name = newName;
         copy.load("id,name");
         await context.sync();
-        const numericId = Number.parseInt(copy.id.replace(/\D/g, ""), 10);
-        return { success: true, operation, sheetId: numericId, sheetName: copy.name };
+        const copyIndex = await getWorksheetStableId(context, copy);
+        return {
+          success: true,
+          operation,
+          sheetId: copyIndex,
+          sheetName: copy.name,
+        };
       }
     }
   });
@@ -858,11 +1167,19 @@ export async function resizeRange(
     const sheet = await getWorksheetById(context, sheetId);
     if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
 
-    const targetRange = range ? sheet.getRange(range) : sheet.getUsedRange();
+    const targetRange = range ? sheet.getRange(range) : sheet.getRange();
 
     if (width) {
       const cols = targetRange.getEntireColumn();
-      cols.format.columnWidth = width.value;
+      if (width.type === "standard") {
+        const pointsPerStandard = await getPointsPerStandardColumnWidth(
+          context,
+          sheet,
+        );
+        cols.format.columnWidth = width.value * pointsPerStandard;
+      } else {
+        cols.format.columnWidth = width.value;
+      }
     }
     if (height) {
       const rows = targetRange.getEntireRow();
@@ -886,7 +1203,10 @@ export interface NavigateResult {
   range?: string;
 }
 
-export async function navigateTo(sheetId: number, range?: string): Promise<NavigateResult> {
+export async function navigateTo(
+  sheetId: number,
+  range?: string,
+): Promise<NavigateResult> {
   return Excel.run(async (context) => {
     const sheet = await getWorksheetById(context, sheetId);
     if (!sheet) throw new Error(`Worksheet with ID ${sheetId} not found`);
@@ -959,23 +1279,39 @@ export async function getWorkbookMetadata(): Promise<WorkbookMetadata> {
     }
     await context.sync();
 
-    const sheetsMetadata: SheetMetadata[] = sheetData.map(({ sheet, usedRange, freezeLocation }) => ({
-      id: Number.parseInt(sheet.id.replace(/\D/g, ""), 10),
-      name: sheet.name,
-      maxRows: usedRange.isNullObject ? 0 : usedRange.rowCount,
-      maxColumns: usedRange.isNullObject ? 0 : usedRange.columnCount,
-      frozenRows: freezeLocation.isNullObject ? 0 : freezeLocation.rowCount,
-      frozenColumns: freezeLocation.isNullObject ? 0 : freezeLocation.columnCount,
-    }));
+    const stableIdMap = await preloadSheetIds(sheets.items);
 
-    const activeSheetId = Number.parseInt(activeSheet.id.replace(/\D/g, ""), 10);
+    const sheetsMetadata: SheetMetadata[] = await Promise.all(
+      sheetData.map(async ({ sheet, usedRange, freezeLocation }) => ({
+        id: stableIdMap.get(sheet.id) || (await getStableSheetId(sheet.id)),
+        name: sheet.name,
+        maxRows: usedRange.isNullObject ? 0 : usedRange.rowCount,
+        maxColumns: usedRange.isNullObject ? 0 : usedRange.columnCount,
+        frozenRows: freezeLocation.isNullObject ? 0 : freezeLocation.rowCount,
+        frozenColumns: freezeLocation.isNullObject
+          ? 0
+          : freezeLocation.columnCount,
+      })),
+    );
+
+    const activeSheetStableId =
+      stableIdMap.get(activeSheet.id) ||
+      (await getStableSheetId(activeSheet.id));
+
     const rangeAddress = selectedRange.address.includes("!")
       ? selectedRange.address.split("!")[1]
       : selectedRange.address;
 
     console.log("[getWorkbookMetadata] activeSheet.id:", activeSheet.id);
     console.log("[getWorkbookMetadata] activeSheet.name:", activeSheet.name);
-    console.log("[getWorkbookMetadata] selectedRange.address:", selectedRange.address);
+    console.log(
+      "[getWorkbookMetadata] activeSheet.stableId:",
+      activeSheetStableId,
+    );
+    console.log(
+      "[getWorkbookMetadata] selectedRange.address:",
+      selectedRange.address,
+    );
     console.log("[getWorkbookMetadata] parsed rangeAddress:", rangeAddress);
 
     return {
@@ -983,11 +1319,89 @@ export async function getWorkbookMetadata(): Promise<WorkbookMetadata> {
       fileName: workbook.name || "Untitled",
       sheetsMetadata,
       totalSheets: sheets.items.length,
-      activeSheetId,
+      activeSheetId: activeSheetStableId,
       activeSheetName: activeSheet.name,
       selectedRange: rangeAddress,
     };
   });
+}
+
+async function clearRowColumnAxis(
+  context: Excel.RequestContext,
+  axis: Excel.RowColumnPivotHierarchyCollection,
+): Promise<void> {
+  axis.load("items");
+  await context.sync();
+  for (const item of axis.items) {
+    axis.remove(item);
+  }
+}
+
+async function clearDataAxis(
+  context: Excel.RequestContext,
+  axis: Excel.DataPivotHierarchyCollection,
+): Promise<void> {
+  axis.load("items");
+  await context.sync();
+  for (const item of axis.items) {
+    axis.remove(item);
+  }
+}
+
+async function applyPivotFields(
+  context: Excel.RequestContext,
+  pivot: Excel.PivotTable,
+  properties: {
+    rows?: { field: string }[];
+    columns?: { field: string }[];
+    values?: { field: string; summarizeBy?: string }[];
+  },
+  clearExisting = false,
+): Promise<void> {
+  if (clearExisting) {
+    if (properties.rows) {
+      await clearRowColumnAxis(context, pivot.rowHierarchies);
+    }
+    if (properties.columns) {
+      await clearRowColumnAxis(context, pivot.columnHierarchies);
+    }
+    if (properties.values) {
+      await clearDataAxis(context, pivot.dataHierarchies);
+    }
+    await context.sync();
+  }
+
+  if (properties.rows) {
+    for (const row of properties.rows) {
+      const hierarchy = pivot.hierarchies.getItem(row.field);
+      pivot.rowHierarchies.add(hierarchy);
+    }
+  }
+
+  if (properties.columns) {
+    for (const column of properties.columns) {
+      const hierarchy = pivot.hierarchies.getItem(column.field);
+      pivot.columnHierarchies.add(hierarchy);
+    }
+  }
+
+  if (properties.values) {
+    const summarizeMap: Record<string, Excel.AggregationFunction> = {
+      sum: Excel.AggregationFunction.sum,
+      count: Excel.AggregationFunction.count,
+      average: Excel.AggregationFunction.average,
+      max: Excel.AggregationFunction.max,
+      min: Excel.AggregationFunction.min,
+    };
+    for (const value of properties.values) {
+      const hierarchy = pivot.hierarchies.getItem(value.field);
+      const dataHierarchy = pivot.dataHierarchies.add(hierarchy);
+      if (value.summarizeBy) {
+        dataHierarchy.summarizeBy =
+          summarizeMap[value.summarizeBy] ?? Excel.AggregationFunction.sum;
+      }
+    }
+  }
 }
 
 export async function modifyObject(params: {
@@ -1022,7 +1436,11 @@ export async function modifyObject(params: {
             throw new Error("Chart creation requires source and chartType");
           }
           const sourceRange = sheet.getRange(properties.source);
-          const chart = charts.add(properties.chartType as Excel.ChartType, sourceRange, Excel.ChartSeriesBy.auto);
+          const chart = charts.add(
+            properties.chartType as Excel.ChartType,
+            sourceRange,
+            Excel.ChartSeriesBy.auto,
+          );
           if (properties.title) chart.title.text = properties.title;
           if (properties.anchor) {
             const anchorCell = sheet.getRange(properties.anchor);
@@ -1035,6 +1453,17 @@ export async function modifyObject(params: {
         case "update": {
           if (!id) throw new Error("Chart update requires id");
           const chart = charts.getItem(id);
+          if (properties?.chartType) {
+            chart.chartType = properties.chartType as Excel.ChartType;
+          }
+          if (properties?.source) {
+            const sourceRange = sheet.getRange(properties.source);
+            chart.setData(sourceRange, Excel.ChartSeriesBy.auto);
+          }
+          if (properties?.anchor) {
+            const anchorCell = sheet.getRange(properties.anchor);
+            chart.setPosition(anchorCell);
+          }
           if (properties?.title) chart.title.text = properties.title;
           await context.sync();
           return { success: true, operation, id };
@@ -1057,9 +1486,14 @@ export async function modifyObject(params: {
           }
           const sourceRange = sheet.getRange(properties.source);
           const destRange = sheet.getRange(properties.range);
-          const pivot = context.workbook.worksheets
-            .getActiveWorksheet()
-            .pivotTables.add(properties.name || "PivotTable", sourceRange, destRange);
+          const pivot = sheet.pivotTables.add(
+            properties.name || "PivotTable",
+            sourceRange,
+            destRange,
+          );
+          if (properties?.rows || properties?.columns || properties?.values) {
+            await applyPivotFields(context, pivot, properties);
+          }
           pivot.load("id");
           await context.sync();
           return { success: true, operation, id: pivot.id };
@@ -1068,6 +1502,9 @@ export async function modifyObject(params: {
           if (!id) throw new Error("PivotTable update requires id");
           const pivot = pivotTables.getItem(id);
           if (properties?.name) pivot.name = properties.name;
+          if (properties?.rows || properties?.columns || properties?.values) {
+            await applyPivotFields(context, pivot, properties, true);
+          }
           await context.sync();
           return { success: true, operation, id };
         }

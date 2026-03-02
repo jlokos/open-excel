@@ -11,11 +11,53 @@ import {
   getProviders,
   type Model,
   streamSimple,
-  type Usage,
 } from "@mariozechner/pi-ai";
 import type { ReactNode } from "react";
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { getWorkbookMetadata } from "../../../lib/excel/api";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { type DirtyRange, mergeRanges } from "../../../lib/dirty-tracker";
+import { getWorkbookMetadata, navigateTo } from "../../../lib/excel/api";
+import {
+  buildFullWorkbookIndex,
+  buildIndexPromptContext,
+  type IndexStatus,
+  updateIndexForDirtyRanges,
+} from "../../../lib/indexing";
+import {
+  agentMessagesToChatMessages,
+  type ChatMessage,
+  deriveStats,
+  extractPartsFromAssistantMessage,
+  generateId,
+  type SessionStats,
+} from "../../../lib/message-utils";
+import {
+  loadOAuthCredentials,
+  refreshOAuthToken,
+  saveOAuthCredentials,
+} from "../../../lib/oauth";
+import {
+  applyProxyToModel,
+  buildCustomModel,
+  loadSavedConfig,
+  type ProviderConfig,
+  saveConfig,
+  type ThinkingLevel,
+} from "../../../lib/provider-config";
+import {
+  addSkill,
+  buildSkillsPromptSection,
+  getInstalledSkills,
+  removeSkill,
+  type SkillMeta,
+  syncSkillsToVfs,
+} from "../../../lib/skills";
 import {
   type ChatSession,
   createSession,
@@ -24,74 +66,45 @@ import {
   getOrCreateWorkbookId,
   getSession,
   listSessions,
+  loadVfsFiles,
+  loadWorkbookIndex,
   saveSession,
+  saveVfsFiles,
 } from "../../../lib/storage";
 import { EXCEL_TOOLS } from "../../../lib/tools";
+import {
+  deleteFile,
+  listUploads,
+  resetVfs,
+  restoreVfs,
+  snapshotVfs,
+  writeFile,
+} from "../../../lib/vfs";
 
-export type ToolCallStatus = "pending" | "running" | "complete" | "error";
+export type {
+  ChatMessage,
+  MessagePart,
+  SessionStats,
+  ToolCallStatus,
+} from "../../../lib/message-utils";
+export type { ProviderConfig, ThinkingLevel };
 
-export type MessagePart =
-  | { type: "text"; text: string }
-  | { type: "thinking"; thinking: string }
-  | {
-      type: "toolCall";
-      id: string;
-      name: string;
-      args: Record<string, unknown>;
-      status: ToolCallStatus;
-      result?: string;
-    };
-
-export interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  parts: MessagePart[];
-  timestamp: number;
-}
-
-export type ThinkingLevel = "none" | "low" | "medium" | "high";
-
-export interface ProviderConfig {
-  provider: string;
-  apiKey: string;
-  model: string;
-  useProxy: boolean;
-  proxyUrl: string;
-  thinking: ThinkingLevel;
-}
-
-export interface SessionStats {
-  inputTokens: number;
-  outputTokens: number;
-  cacheRead: number;
-  cacheWrite: number;
-  totalCost: number;
-  contextWindow: number;
-  lastUsage: Usage | null;
-}
-
-const STORAGE_KEY = "openexcel-provider-config";
-
-function loadSavedConfig(): ProviderConfig | null {
+function parseDirtyRanges(result: string | undefined): DirtyRange[] | null {
+  if (!result) return null;
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const config = JSON.parse(saved);
-      if (config.proxyUrl === undefined) {
-        config.proxyUrl = "";
-      }
-      return config;
+    const parsed = JSON.parse(result);
+    if (parsed._dirtyRanges && Array.isArray(parsed._dirtyRanges)) {
+      return parsed._dirtyRanges;
     }
-  } catch {}
+  } catch {
+    // Not valid JSON or no dirty ranges
+  }
   return null;
 }
 
-function applyProxyToModel(model: Model<any>, config: ProviderConfig): Model<any> {
-  if (!config.useProxy || !config.proxyUrl || !model.baseUrl) return model;
-  return {
-    ...model,
-    baseUrl: `${config.proxyUrl}/?url=${encodeURIComponent(model.baseUrl)}`,
-  };
+export interface UploadedFile {
+  name: string;
+  size: number;
 }
 
 interface ChatState {
@@ -102,21 +115,21 @@ interface ChatState {
   sessionStats: SessionStats;
   currentSession: ChatSession | null;
   sessions: ChatSession[];
+  sheetNames: Record<number, string>;
+  uploads: UploadedFile[];
+  isUploading: boolean;
+  skills: SkillMeta[];
+  indexStatus: IndexStatus;
+  indexError: string | null;
+  indexUpdatedAt: number | null;
+  indexBlockCount: number;
 }
 
-const INITIAL_STATS: SessionStats = {
-  inputTokens: 0,
-  outputTokens: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalCost: 0,
-  contextWindow: 0,
-  lastUsage: null,
-};
+const INITIAL_STATS: SessionStats = { ...deriveStats([]), contextWindow: 0 };
 
 interface ChatContextValue {
   state: ChatState;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, attachments?: string[]) => Promise<void>;
   setProviderConfig: (config: ProviderConfig) => void;
   clearMessages: () => void;
   abort: () => void;
@@ -125,20 +138,141 @@ interface ChatContextValue {
   newSession: () => Promise<void>;
   switchSession: (sessionId: string) => Promise<void>;
   deleteCurrentSession: () => Promise<void>;
+  getSheetName: (sheetId: number) => string | undefined;
+  toggleFollowMode: () => void;
+  processFiles: (files: File[]) => Promise<void>;
+  removeUpload: (name: string) => Promise<void>;
+  installSkill: (files: File[]) => Promise<void>;
+  uninstallSkill: (name: string) => Promise<void>;
+  refreshWorkbookIndex: () => Promise<void>;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
 
-const SYSTEM_PROMPT = `You are an AI assistant integrated into Microsoft Excel with full access to read and modify spreadsheet data.
+interface ExcelLocaleInfo {
+  formulaLanguage: string | null;
+  displayLanguage: string | null;
+  cultureName: string | null;
+  decimalSeparator: string | null;
+  thousandsSeparator: string | null;
+  formulaArgumentSeparator: string | null;
+}
+
+function inferFormulaArgumentSeparator(
+  decimalSeparator: string | null,
+): string | null {
+  if (!decimalSeparator) return null;
+  return decimalSeparator === "," ? ";" : ",";
+}
+
+async function loadExcelLocaleInfo(): Promise<ExcelLocaleInfo> {
+  const formulaLanguage = Office.context.contentLanguage ?? null;
+  const displayLanguage = Office.context.displayLanguage ?? null;
+
+  let cultureName: string | null = null;
+  let decimalSeparator: string | null = null;
+  let thousandsSeparator: string | null = null;
+
+  try {
+    await Excel.run(async (context) => {
+      const app = context.workbook.application;
+      app.load("decimalSeparator,thousandsSeparator,cultureInfo/name");
+      await context.sync();
+
+      cultureName = app.cultureInfo.name ?? null;
+      decimalSeparator = app.decimalSeparator ?? null;
+      thousandsSeparator = app.thousandsSeparator ?? null;
+    });
+  } catch (err) {
+    console.warn("[Chat] Failed to load Excel locale info:", err);
+  }
+
+  return {
+    formulaLanguage,
+    displayLanguage,
+    cultureName,
+    decimalSeparator,
+    thousandsSeparator,
+    formulaArgumentSeparator: inferFormulaArgumentSeparator(decimalSeparator),
+  };
+}
+
+function buildLocalePromptSection(locale: ExcelLocaleInfo | null): string {
+  if (!locale) return "";
+
+  const hasAnyValue =
+    locale.formulaLanguage ||
+    locale.displayLanguage ||
+    locale.cultureName ||
+    locale.decimalSeparator ||
+    locale.thousandsSeparator ||
+    locale.formulaArgumentSeparator;
+  if (!hasAnyValue) return "";
+
+  const lines = [
+    "",
+    "EXCEL LOCALE (AUTO-DETECTED):",
+    `- Formula language (Office editing language): ${locale.formulaLanguage ?? "unknown"}`,
+    `- Display language: ${locale.displayLanguage ?? "unknown"}`,
+    `- Excel culture: ${locale.cultureName ?? "unknown"}`,
+    `- Decimal separator: ${locale.decimalSeparator ?? "unknown"}`,
+    `- Thousands separator: ${locale.thousandsSeparator ?? "unknown"}`,
+    `- Formula argument separator: ${locale.formulaArgumentSeparator ?? "unknown"}${locale.decimalSeparator ? " (inferred from decimal separator)" : ""}`,
+    "",
+    "When writing formulas, always use the localized function names and separators shown above.",
+  ];
+
+  return lines.join("\n");
+}
+
+function buildSystemPrompt(
+  skills: SkillMeta[],
+  locale: ExcelLocaleInfo | null,
+): string {
+  return `You are an AI assistant integrated into Microsoft Excel with full access to read and modify spreadsheet data.
 
 Available tools:
-READ:
+
+FILES & SHELL:
+- read: Read uploaded files (images, CSV, text). Images are returned for visual analysis.
+- bash: Execute bash commands in a sandboxed virtual filesystem. User uploads are in /home/user/uploads/.
+  Supports: ls, cat, grep, find, awk, sed, jq, sort, uniq, wc, cut, head, tail, etc.
+
+  Custom commands for efficient data transfer (data flows directly, never enters your context):
+  - csv-to-sheet <file> <sheetId> [startCell] [--force] — Import CSV from VFS into spreadsheet. Auto-detects types.
+    Fails if target cells already have data. Use --force to overwrite (confirm with user first).
+  - sheet-to-csv <sheetId> [range] [file] — Export range to CSV. Defaults to full used range if no range given. Prints to stdout if no file given (pipeable).
+  - pdf-to-text <file> <outfile> — Extract text from PDF to file. Use head/grep/tail to read selectively.
+  - pdf-to-images <file> <outdir> [--scale=N] [--pages=1,3,5-8] — Render PDF pages to PNG images. Use for scanned PDFs where text extraction won't work. Then use read to visually inspect the images.
+  - docx-to-text <file> <outfile> — Extract text from DOCX to file.
+  - xlsx-to-csv <file> <outfile> [sheet] — Convert XLSX/XLS/ODS sheet to CSV. Sheet by name or 0-based index.
+  - image-to-sheet <file> <width> <height> <sheetId> [startCell] [--cell-size=N] — Render an image as pixel art in Excel. Downsamples to target size and paints cell backgrounds. Cell size in points (default: 3). Max 500×500. Example: image-to-sheet uploads/logo.png 64 64 1 A1 --cell-size=4
+  - web-search <query> [--max=N] [--region=REGION] [--time=d|w|m|y] [--page=N] [--json] — Search the web. Returns title, URL, and snippet for each result.
+  - web-fetch <url> <outfile> — Fetch a web page and extract its readable content to a file. Use head/grep/tail to read selectively.
+
+  Examples:
+    csv-to-sheet uploads/data.csv 1 A1       # import CSV to sheet 1
+    sheet-to-csv 1 export.csv                 # export entire sheet to file
+    sheet-to-csv 1 A1:D100 export.csv         # export specific range to file
+    sheet-to-csv 1 | sort -t, -k3 -rn | head -20   # pipe entire sheet to analysis
+    cut -d, -f1,3 uploads/data.csv > filtered.csv && csv-to-sheet filtered.csv 1 A1  # filter then import
+    web-search "S&P 500 companies list"       # search the web
+    web-search "USD EUR exchange rate" --max=5 --time=w  # recent results only
+    web-fetch https://example.com/article page.txt && grep -i "revenue" page.txt  # fetch then grep
+
+  IMPORTANT: When importing file data into the spreadsheet, ALWAYS prefer csv-to-sheet over reading
+  the file content and calling set_cell_range. This avoids wasting tokens on data that doesn't need
+  to pass through your context.
+
+When the user uploads files, an <attachments> section lists their paths. Use read to access them.
+
+EXCEL READ:
 - get_cell_ranges: Read cell values, formulas, and formatting
 - get_range_as_csv: Get data as CSV (great for analysis)
 - search_data: Find text across the spreadsheet
 - get_all_objects: List charts, pivot tables, etc.
 
-WRITE:
+EXCEL WRITE:
 - set_cell_range: Write values, formulas, and formatting
 - clear_cell_range: Clear contents or formatting
 - copy_to: Copy ranges with formula translation
@@ -147,55 +281,35 @@ WRITE:
 - resize_range: Adjust column widths and row heights
 - modify_object: Create/update/delete charts and pivot tables
 
+FORMAT SAFETY:
+- If set_cell_range returns a formatting overwrite error, ask the user for confirmation and retry with allow_format_overwrite=true.
+- Do not set allow_format_overwrite=true on first attempt unless the user explicitly asked to overwrite existing formatting.
+
 Citations: Use markdown links with #cite: hash to reference sheets/cells. Clicking navigates there.
 - Sheet only: [Sheet Name](#cite:sheetId)
 - Cell/range: [A1:B10](#cite:sheetId!A1:B10)
 Example: [Exchange Ratio](#cite:3) or [see cell B5](#cite:3!B5)
 
-When the user asks about their data, read it first. Be concise. Use A1 notation for cell references.`;
+When a <wb_index_context> section is present in user messages, treat it as preferred workbook style/template guidance.
+Mirror those patterns for new output unless user instructions conflict.
 
-function generateId(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+${buildLocalePromptSection(locale)}
+
+When the user asks about their data, read it first. Be concise. Use A1 notation for cell references.
+
+${buildSkillsPromptSection(skills)}
+`;
 }
 
 function thinkingLevelToAgent(level: ThinkingLevel): AgentThinkingLevel {
   return level === "none" ? "off" : level;
 }
 
-function extractPartsFromAssistantMessage(message: AgentMessage, existingParts: MessagePart[] = []): MessagePart[] {
-  if (message.role !== "assistant") return existingParts;
-
-  const assistantMsg = message as AssistantMessage;
-  const existingToolCalls = new Map<string, MessagePart>();
-  for (const part of existingParts) {
-    if (part.type === "toolCall") {
-      existingToolCalls.set(part.id, part);
-    }
-  }
-
-  return assistantMsg.content.map((block): MessagePart => {
-    if (block.type === "text") {
-      return { type: "text", text: block.text };
-    }
-    if (block.type === "thinking") {
-      return { type: "thinking", thinking: block.thinking };
-    }
-    const existing = existingToolCalls.get(block.id);
-    return {
-      type: "toolCall",
-      id: block.id,
-      name: block.name,
-      args: block.arguments as Record<string, unknown>,
-      status: existing?.type === "toolCall" ? existing.status : "pending",
-      result: existing?.type === "toolCall" ? existing.result : undefined,
-    };
-  });
-}
-
 export function ChatProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<ChatState>(() => {
     const saved = loadSavedConfig();
-    const validConfig = saved?.provider && saved?.apiKey && saved?.model ? saved : null;
+    const validConfig =
+      saved?.provider && saved?.apiKey && saved?.model ? saved : null;
     return {
       messages: [],
       isStreaming: false,
@@ -204,6 +318,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       sessionStats: INITIAL_STATS,
       currentSession: null,
       sessions: [],
+      sheetNames: {},
+      uploads: [],
+      isUploading: false,
+      skills: [],
+      indexStatus: "idle",
+      indexError: null,
+      indexUpdatedAt: null,
+      indexBlockCount: 0,
     };
   });
 
@@ -214,6 +336,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const workbookIdRef = useRef<string | null>(null);
   const sessionLoadedRef = useRef(false);
   const currentSessionIdRef = useRef<string | null>(null);
+  const followModeRef = useRef(state.providerConfig?.followMode ?? true);
+  const skillsRef = useRef<SkillMeta[]>([]);
+  const localeInfoRef = useRef<ExcelLocaleInfo | null>(null);
+  const indexingEnabledRef = useRef(true);
+  const isIndexingRef = useRef(false);
+  const pendingDirtyRangesRef = useRef<DirtyRange[]>([]);
+  const forceFullIndexRef = useRef(false);
 
   const availableProviders = getProviders();
 
@@ -225,184 +354,398 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const handleAgentEvent = useCallback((event: AgentEvent) => {
-    console.log("[Chat] Agent event:", event.type, event);
-    switch (event.type) {
-      case "message_start": {
-        if (event.message.role === "assistant") {
-          const id = generateId();
-          streamingMessageIdRef.current = id;
-          const parts = extractPartsFromAssistantMessage(event.message);
-          const chatMessage: ChatMessage = {
-            id,
-            role: "assistant",
-            parts,
-            timestamp: event.message.timestamp,
-          };
-          setState((prev) => ({
-            ...prev,
-            messages: [...prev.messages, chatMessage],
-          }));
+  const buildCanonicalState = useCallback(
+    (
+      agentMessages: AgentMessage[],
+      contextWindow: number,
+      previousMessages: ChatMessage[] = [],
+    ) => ({
+      messages: agentMessagesToChatMessages(agentMessages, previousMessages),
+      sessionStats: {
+        ...deriveStats(agentMessages),
+        contextWindow,
+      },
+    }),
+    [],
+  );
+
+  const syncCanonicalState = useCallback(
+    (agentMessages: AgentMessage[], isStreaming?: boolean) => {
+      setState((prev) => {
+        const canonical = buildCanonicalState(
+          agentMessages,
+          prev.sessionStats.contextWindow,
+          prev.messages,
+        );
+        return {
+          ...prev,
+          ...canonical,
+          ...(isStreaming === undefined ? {} : { isStreaming }),
+        };
+      });
+    },
+    [buildCanonicalState],
+  );
+
+  const runWorkbookIndexJob = useCallback(
+    async (kind: "full" | "dirty", dirtyRanges: DirtyRange[] = []) => {
+      if (!indexingEnabledRef.current) return;
+      const workbookId = workbookIdRef.current;
+      if (!workbookId) return;
+
+      if (isIndexingRef.current) {
+        if (kind === "full") {
+          forceFullIndexRef.current = true;
+        } else if (dirtyRanges.length > 0) {
+          pendingDirtyRangesRef.current = mergeRanges([
+            ...pendingDirtyRangesRef.current,
+            ...dirtyRanges,
+          ]);
         }
-        break;
+        setState((prev) => ({
+          ...prev,
+          indexStatus:
+            prev.indexStatus === "ready" ? "stale" : prev.indexStatus,
+        }));
+        return;
       }
-      case "message_update": {
-        if (event.message.role === "assistant" && streamingMessageIdRef.current) {
+
+      isIndexingRef.current = true;
+      setState((prev) => ({
+        ...prev,
+        indexStatus: "indexing",
+        indexError: null,
+      }));
+
+      const started = performance.now();
+      try {
+        const index =
+          kind === "full"
+            ? await buildFullWorkbookIndex(workbookId)
+            : await updateIndexForDirtyRanges(workbookId, dirtyRanges);
+        setState((prev) => ({
+          ...prev,
+          indexStatus: "ready",
+          indexError: null,
+          indexUpdatedAt: index.updatedAt,
+          indexBlockCount: index.blockCount,
+        }));
+
+        console.log("[Index] Job complete", {
+          kind,
+          blocks: index.blockCount,
+          durationMs: Math.round(performance.now() - started),
+        });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to index workbook";
+        console.error("[Index] Job failed:", err);
+        setState((prev) => ({
+          ...prev,
+          indexStatus: prev.indexStatus === "ready" ? "stale" : "error",
+          indexError: message,
+        }));
+      } finally {
+        isIndexingRef.current = false;
+
+        if (forceFullIndexRef.current) {
+          forceFullIndexRef.current = false;
+          void runWorkbookIndexJob("full");
+        } else if (pendingDirtyRangesRef.current.length > 0) {
+          const merged = mergeRanges(pendingDirtyRangesRef.current);
+          pendingDirtyRangesRef.current = [];
+          void runWorkbookIndexJob("dirty", merged);
+        }
+      }
+    },
+    [],
+  );
+
+  const refreshWorkbookIndex = useCallback(async () => {
+    await runWorkbookIndexJob("full");
+  }, [runWorkbookIndexJob]);
+
+  const handleAgentEvent = useCallback(
+    (event: AgentEvent) => {
+      console.log("[Chat] Agent event:", event.type, event);
+      switch (event.type) {
+        case "message_start": {
+          if (event.message.role === "assistant") {
+            const id = generateId();
+            streamingMessageIdRef.current = id;
+            const parts = extractPartsFromAssistantMessage(event.message);
+            const chatMessage: ChatMessage = {
+              id,
+              role: "assistant",
+              parts,
+              timestamp: event.message.timestamp,
+            };
+            setState((prev) => ({
+              ...prev,
+              messages: [...prev.messages, chatMessage],
+            }));
+          }
+          break;
+        }
+        case "message_update": {
+          const streamingMessageId = streamingMessageIdRef.current;
+          if (event.message.role === "assistant" && streamingMessageId) {
+            setState((prev) => {
+              const messages = [...prev.messages];
+              const idx = messages.findIndex(
+                (m) => m.id === streamingMessageId,
+              );
+              if (idx !== -1) {
+                const parts = extractPartsFromAssistantMessage(
+                  event.message,
+                  messages[idx].parts,
+                );
+                messages[idx] = { ...messages[idx], parts };
+              }
+              return { ...prev, messages };
+            });
+          }
+          break;
+        }
+        case "message_end": {
+          if (event.message.role === "assistant") {
+            const streamingMessageId = streamingMessageIdRef.current;
+            const assistantMsg = event.message as AssistantMessage;
+            const isError =
+              assistantMsg.stopReason === "error" ||
+              assistantMsg.stopReason === "aborted";
+            const errorMessage = assistantMsg.errorMessage || "Request failed";
+            console.log("[Chat] Assistant message result:", event.message);
+            console.log("[Chat] Usage:", assistantMsg.usage);
+            console.log(
+              "[Chat] stopReason:",
+              assistantMsg.stopReason,
+              "errorMessage:",
+              assistantMsg.errorMessage,
+            );
+
+            setState((prev) => {
+              const messages = [...prev.messages];
+              const idx = streamingMessageId
+                ? messages.findIndex((m) => m.id === streamingMessageId)
+                : -1;
+              const existingParts = idx !== -1 ? messages[idx].parts : [];
+              const parts = extractPartsFromAssistantMessage(
+                event.message,
+                existingParts,
+              );
+
+              if (idx !== -1) {
+                messages[idx] = { ...messages[idx], parts };
+              } else {
+                messages.push({
+                  id: generateId(),
+                  role: "assistant",
+                  parts,
+                  timestamp: event.message.timestamp,
+                });
+              }
+
+              return {
+                ...prev,
+                messages,
+                error: isError ? errorMessage : prev.error,
+              };
+            });
+            if (streamingMessageIdRef.current === streamingMessageId) {
+              streamingMessageIdRef.current = null;
+            }
+          }
+          break;
+        }
+        case "tool_execution_start": {
           setState((prev) => {
             const messages = [...prev.messages];
-            const idx = messages.findIndex((m) => m.id === streamingMessageIdRef.current);
-            if (idx !== -1) {
-              const parts = extractPartsFromAssistantMessage(event.message, messages[idx].parts);
-              messages[idx] = { ...messages[idx], parts };
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const msg = messages[i];
+              const partIdx = msg.parts.findIndex(
+                (p) => p.type === "toolCall" && p.id === event.toolCallId,
+              );
+              if (partIdx !== -1) {
+                const parts = [...msg.parts];
+                const part = parts[partIdx];
+                if (part.type === "toolCall") {
+                  parts[partIdx] = { ...part, status: "running" };
+                  messages[i] = { ...msg, parts };
+                }
+                break;
+              }
             }
             return { ...prev, messages };
           });
+          break;
         }
-        break;
-      }
-      case "message_end": {
-        if (event.message.role === "assistant") {
-          const assistantMsg = event.message as AssistantMessage;
-          const isError = assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted";
-          console.log("[Chat] Assistant message result:", event.message);
-          console.log("[Chat] Usage:", assistantMsg.usage);
-          console.log("[Chat] stopReason:", assistantMsg.stopReason, "errorMessage:", assistantMsg.errorMessage);
+        case "tool_execution_update": {
+          setState((prev) => {
+            const messages = [...prev.messages];
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const msg = messages[i];
+              const partIdx = msg.parts.findIndex(
+                (p) => p.type === "toolCall" && p.id === event.toolCallId,
+              );
+              if (partIdx !== -1) {
+                const parts = [...msg.parts];
+                const part = parts[partIdx];
+                if (part.type === "toolCall") {
+                  let partialText: string;
+                  if (typeof event.partialResult === "string") {
+                    partialText = event.partialResult;
+                  } else if (
+                    event.partialResult?.content &&
+                    Array.isArray(event.partialResult.content)
+                  ) {
+                    partialText = event.partialResult.content
+                      .filter((c: { type: string }) => c.type === "text")
+                      .map((c: { text: string }) => c.text)
+                      .join("\n");
+                  } else {
+                    partialText = JSON.stringify(event.partialResult, null, 2);
+                  }
+                  parts[partIdx] = { ...part, result: partialText };
+                  messages[i] = { ...msg, parts };
+                }
+                break;
+              }
+            }
+            return { ...prev, messages };
+          });
+          break;
+        }
+        case "tool_execution_end": {
+          let resultText: string;
+          let resultImages: { data: string; mimeType: string }[] | undefined;
+          if (typeof event.result === "string") {
+            resultText = event.result;
+          } else if (
+            event.result?.content &&
+            Array.isArray(event.result.content)
+          ) {
+            resultText = event.result.content
+              .filter((c: { type: string }) => c.type === "text")
+              .map((c: { text: string }) => c.text)
+              .join("\n");
+            const images = event.result.content
+              .filter((c: { type: string }) => c.type === "image")
+              .map((c: { data: string; mimeType: string }) => ({
+                data: c.data,
+                mimeType: c.mimeType,
+              }));
+            if (images.length > 0) resultImages = images;
+          } else {
+            resultText = JSON.stringify(event.result, null, 2);
+          }
+
+          const dirtyRanges = !event.isError
+            ? parseDirtyRanges(resultText)
+            : null;
+
+          if (!event.isError && followModeRef.current) {
+            if (dirtyRanges && dirtyRanges.length > 0) {
+              const first = dirtyRanges[0];
+              if (first.sheetId >= 0 && first.range !== "*") {
+                navigateTo(first.sheetId, first.range).catch((err) => {
+                  console.error("[FollowMode] Navigation failed:", err);
+                });
+              } else if (first.sheetId >= 0) {
+                // For whole-sheet changes, just activate the sheet
+                navigateTo(first.sheetId).catch((err) => {
+                  console.error("[FollowMode] Navigation failed:", err);
+                });
+              }
+            }
+          }
+
+          if (!event.isError && dirtyRanges && dirtyRanges.length > 0) {
+            void runWorkbookIndexJob("dirty", dirtyRanges);
+          }
 
           setState((prev) => {
             const messages = [...prev.messages];
-            const idx = messages.findIndex((m) => m.id === streamingMessageIdRef.current);
-
-            if (isError) {
-              if (idx !== -1) {
-                messages.splice(idx, 1);
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const msg = messages[i];
+              const partIdx = msg.parts.findIndex(
+                (p) => p.type === "toolCall" && p.id === event.toolCallId,
+              );
+              if (partIdx !== -1) {
+                const parts = [...msg.parts];
+                const part = parts[partIdx];
+                if (part.type === "toolCall") {
+                  parts[partIdx] = {
+                    ...part,
+                    status: event.isError ? "error" : "complete",
+                    result: resultText,
+                    images: resultImages,
+                  };
+                  messages[i] = { ...msg, parts };
+                }
+                break;
               }
-            } else if (idx !== -1) {
-              const parts = extractPartsFromAssistantMessage(event.message, messages[idx].parts);
-              messages[idx] = { ...messages[idx], parts };
             }
-
-            return {
-              ...prev,
-              messages,
-              error: isError ? assistantMsg.errorMessage || "Request failed" : prev.error,
-              sessionStats: isError
-                ? prev.sessionStats
-                : {
-                    inputTokens: prev.sessionStats.inputTokens + assistantMsg.usage.input,
-                    outputTokens: prev.sessionStats.outputTokens + assistantMsg.usage.output,
-                    cacheRead: prev.sessionStats.cacheRead + assistantMsg.usage.cacheRead,
-                    cacheWrite: prev.sessionStats.cacheWrite + assistantMsg.usage.cacheWrite,
-                    totalCost: prev.sessionStats.totalCost + assistantMsg.usage.cost.total,
-                    contextWindow: prev.sessionStats.contextWindow,
-                    lastUsage: assistantMsg.usage,
-                  },
-            };
+            return { ...prev, messages };
           });
-          streamingMessageIdRef.current = null;
+          break;
         }
-        break;
+        case "agent_end": {
+          isStreamingRef.current = false;
+          const currentAgentMessages = agentRef.current?.state.messages;
+          const agentMessages = currentAgentMessages ?? event.messages ?? [];
+          syncCanonicalState(agentMessages, false);
+          streamingMessageIdRef.current = null;
+          break;
+        }
       }
-      case "tool_execution_start": {
-        setState((prev) => {
-          const messages = [...prev.messages];
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            const partIdx = msg.parts.findIndex((p) => p.type === "toolCall" && p.id === event.toolCallId);
-            if (partIdx !== -1) {
-              const parts = [...msg.parts];
-              const part = parts[partIdx];
-              if (part.type === "toolCall") {
-                parts[partIdx] = { ...part, status: "running" };
-                messages[i] = { ...msg, parts };
-              }
-              break;
-            }
-          }
-          return { ...prev, messages };
-        });
-        break;
+    },
+    [syncCanonicalState, runWorkbookIndexJob],
+  );
+
+  const configRef = useRef<ProviderConfig | null>(null);
+
+  const getActiveApiKey = useCallback(
+    async (config: ProviderConfig): Promise<string> => {
+      if (config.authMethod !== "oauth") {
+        return config.apiKey;
       }
-      case "tool_execution_update": {
-        setState((prev) => {
-          const messages = [...prev.messages];
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            const partIdx = msg.parts.findIndex((p) => p.type === "toolCall" && p.id === event.toolCallId);
-            if (partIdx !== -1) {
-              const parts = [...msg.parts];
-              const part = parts[partIdx];
-              if (part.type === "toolCall") {
-                let partialText: string;
-                if (typeof event.partialResult === "string") {
-                  partialText = event.partialResult;
-                } else if (event.partialResult?.content && Array.isArray(event.partialResult.content)) {
-                  partialText = event.partialResult.content
-                    .filter((c: { type: string }) => c.type === "text")
-                    .map((c: { text: string }) => c.text)
-                    .join("\n");
-                } else {
-                  partialText = JSON.stringify(event.partialResult, null, 2);
-                }
-                parts[partIdx] = { ...part, result: partialText };
-                messages[i] = { ...msg, parts };
-              }
-              break;
-            }
-          }
-          return { ...prev, messages };
-        });
-        break;
+      const creds = loadOAuthCredentials(config.provider);
+      if (!creds) return config.apiKey;
+      if (Date.now() < creds.expires) {
+        return creds.access;
       }
-      case "tool_execution_end": {
-        setState((prev) => {
-          const messages = [...prev.messages];
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            const partIdx = msg.parts.findIndex((p) => p.type === "toolCall" && p.id === event.toolCallId);
-            if (partIdx !== -1) {
-              const parts = [...msg.parts];
-              const part = parts[partIdx];
-              if (part.type === "toolCall") {
-                let resultText: string;
-                if (typeof event.result === "string") {
-                  resultText = event.result;
-                } else if (event.result?.content && Array.isArray(event.result.content)) {
-                  resultText = event.result.content
-                    .filter((c: { type: string }) => c.type === "text")
-                    .map((c: { text: string }) => c.text)
-                    .join("\n");
-                } else {
-                  resultText = JSON.stringify(event.result, null, 2);
-                }
-                parts[partIdx] = { ...part, status: event.isError ? "error" : "complete", result: resultText };
-                messages[i] = { ...msg, parts };
-              }
-              break;
-            }
-          }
-          return { ...prev, messages };
-        });
-        break;
-      }
-      case "agent_end": {
-        isStreamingRef.current = false;
-        setState((prev) => ({ ...prev, isStreaming: false }));
-        streamingMessageIdRef.current = null;
-        break;
-      }
-    }
-  }, []);
+      console.log("[Chat] Refreshing OAuth token before API call...");
+      const refreshed = await refreshOAuthToken(
+        config.provider,
+        creds.refresh,
+        config.proxyUrl,
+        config.useProxy,
+      );
+      saveOAuthCredentials(config.provider, refreshed);
+      console.log("[Chat] OAuth token refreshed");
+      return refreshed.access;
+    },
+    [],
+  );
 
   const applyConfig = useCallback(
     (config: ProviderConfig) => {
       let contextWindow = 0;
       let baseModel: Model<any>;
-      try {
-        baseModel = getModel(config.provider as any, config.model as any);
-        contextWindow = baseModel.contextWindow;
-      } catch {
-        return;
+      if (config.provider === "custom") {
+        const custom = buildCustomModel(config);
+        if (!custom) return;
+        baseModel = custom;
+      } else {
+        try {
+          baseModel = getModel(config.provider as any, config.model as any);
+        } catch {
+          return;
+        }
       }
+      contextWindow = baseModel.contextWindow;
+      configRef.current = config;
 
       const proxiedModel = applyProxyToModel(baseModel, config);
       const existingMessages = agentRef.current?.state.messages ?? [];
@@ -411,18 +754,31 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         agentRef.current.abort();
       }
 
+      const systemPrompt = buildSystemPrompt(
+        skillsRef.current,
+        localeInfoRef.current,
+      );
+      console.log(
+        "[Chat] Skills in prompt:",
+        skillsRef.current.length,
+        skillsRef.current.map((s) => s.name),
+      );
+      console.log("[Chat] System prompt tail:", systemPrompt.slice(-500));
+
       const agent = new Agent({
         initialState: {
           model: proxiedModel,
-          systemPrompt: SYSTEM_PROMPT,
+          systemPrompt,
           thinkingLevel: thinkingLevelToAgent(config.thinking),
           tools: EXCEL_TOOLS,
           messages: existingMessages,
         },
-        streamFn: (model, context, options) => {
+        streamFn: async (model, context, options) => {
+          const cfg = configRef.current ?? config;
+          const apiKey = await getActiveApiKey(cfg);
           return streamSimple(model, context, {
             ...options,
-            apiKey: config.apiKey,
+            apiKey,
           });
         },
       });
@@ -430,6 +786,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       agent.subscribe(handleAgentEvent);
       pendingConfigRef.current = null;
 
+      followModeRef.current = config.followMode ?? true;
       console.log("[Chat] Model info:", {
         id: baseModel.id,
         contextWindow: baseModel.contextWindow,
@@ -445,7 +802,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         sessionStats: { ...prev.sessionStats, contextWindow },
       }));
     },
-    [handleAgentEvent],
+    [handleAgentEvent, getActiveApiKey],
   );
 
   const setProviderConfig = useCallback(
@@ -467,13 +824,16 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, attachments?: string[]) => {
       if (pendingConfigRef.current) {
         applyConfig(pendingConfigRef.current);
       }
       const agent = agentRef.current;
       if (!agent || !state.providerConfig) {
-        setState((prev) => ({ ...prev, error: "Please configure your API key first" }));
+        setState((prev) => ({
+          ...prev,
+          error: "Please configure your API key first",
+        }));
         return;
       }
 
@@ -494,14 +854,49 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       try {
         let promptContent = content;
+        let indexContextSection = "";
+        let wbContextSection = "";
+        if (workbookIdRef.current && indexingEnabledRef.current) {
+          try {
+            const indexContext = await buildIndexPromptContext(
+              workbookIdRef.current,
+              content,
+            );
+            if (indexContext) {
+              indexContextSection = `<wb_index_context>\n${indexContext}\n</wb_index_context>\n\n`;
+            }
+          } catch (err) {
+            console.warn("[Chat] Failed to query workbook index:", err);
+          }
+        }
+
         try {
           console.log("[Chat] Fetching workbook metadata...");
           const metadata = await getWorkbookMetadata();
           console.log("[Chat] Workbook metadata:", metadata);
-          promptContent = `<wb_context>\n${JSON.stringify(metadata, null, 2)}\n</wb_context>\n\n${content}`;
+          wbContextSection = `<wb_context>\n${JSON.stringify(metadata, null, 2)}\n</wb_context>\n\n`;
+
+          if (metadata.sheetsMetadata) {
+            const newSheetNames: Record<number, string> = {};
+            for (const sheet of metadata.sheetsMetadata) {
+              newSheetNames[sheet.id] = sheet.name;
+            }
+            setState((prev) => ({ ...prev, sheetNames: newSheetNames }));
+          }
         } catch (err) {
           console.error("[Chat] Failed to get workbook metadata:", err);
         }
+
+        promptContent = `${indexContextSection}${wbContextSection}${content}`;
+
+        // Add attachments section if files are uploaded
+        if (attachments && attachments.length > 0) {
+          const paths = attachments
+            .map((name) => `/home/user/uploads/${name}`)
+            .join("\n");
+          promptContent = `<attachments>\n${paths}\n</attachments>\n\n${promptContent}`;
+        }
+
         await agent.prompt(promptContent);
         console.log("[Chat] Full context:", agent.state.messages);
       } catch (err) {
@@ -520,10 +915,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const clearMessages = useCallback(() => {
     abort();
     agentRef.current?.reset();
+    resetVfs();
     if (currentSessionIdRef.current) {
-      saveSession(currentSessionIdRef.current, []).catch(console.error);
+      Promise.all([
+        saveSession(currentSessionIdRef.current, []),
+        saveVfsFiles(currentSessionIdRef.current, []),
+      ]).catch(console.error);
     }
-    setState((prev) => ({ ...prev, messages: [], error: null, sessionStats: INITIAL_STATS }));
+    setState((prev) => ({
+      ...prev,
+      messages: [],
+      error: null,
+      sessionStats: INITIAL_STATS,
+      uploads: [],
+    }));
   }, [abort]);
 
   const refreshSessions = useCallback(async () => {
@@ -531,7 +936,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const sessions = await listSessions(workbookIdRef.current);
     console.log(
       "[Chat] refreshSessions:",
-      sessions.map((s) => ({ id: s.id, name: s.name, msgs: s.messages.length })),
+      sessions.map((s) => ({
+        id: s.id,
+        name: s.name,
+        msgs: (s.agentMessages ?? []).length,
+      })),
     );
     setState((prev) => ({ ...prev, sessions }));
   }, []);
@@ -548,6 +957,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
     try {
       agentRef.current?.reset();
+      resetVfs();
       const session = await createSession(workbookIdRef.current);
       console.log("[Chat] Created new session:", session.id);
       currentSessionIdRef.current = session.id;
@@ -558,39 +968,68 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         currentSession: session,
         error: null,
         sessionStats: INITIAL_STATS,
+        uploads: [],
       }));
     } catch (err) {
       console.error("[Chat] Failed to create session:", err);
     }
   }, [refreshSessions]);
 
-  const switchSession = useCallback(async (sessionId: string) => {
-    console.log("[Chat] switchSession called:", sessionId, "current:", currentSessionIdRef.current);
-    if (currentSessionIdRef.current === sessionId) return;
-    if (isStreamingRef.current) {
-      console.log("[Chat] switchSession blocked: streaming in progress");
-      return;
-    }
-    agentRef.current?.reset();
-    try {
-      const session = await getSession(sessionId);
-      console.log("[Chat] Got session:", session?.id, "messages:", session?.messages.length);
-      if (!session) {
-        console.error("[Chat] Session not found:", sessionId);
+  const switchSession = useCallback(
+    async (sessionId: string) => {
+      console.log(
+        "[Chat] switchSession called:",
+        sessionId,
+        "current:",
+        currentSessionIdRef.current,
+      );
+      if (currentSessionIdRef.current === sessionId) return;
+      if (isStreamingRef.current) {
+        console.log("[Chat] switchSession blocked: streaming in progress");
         return;
       }
-      currentSessionIdRef.current = session.id;
-      setState((prev) => ({
-        ...prev,
-        messages: session.messages,
-        currentSession: session,
-        error: null,
-        sessionStats: INITIAL_STATS,
-      }));
-    } catch (err) {
-      console.error("[Chat] Failed to switch session:", err);
-    }
-  }, []);
+      agentRef.current?.reset();
+      try {
+        const [session, vfsFiles] = await Promise.all([
+          getSession(sessionId),
+          loadVfsFiles(sessionId),
+        ]);
+        console.log(
+          "[Chat] switchSession loaded:",
+          session?.id,
+          "agentMessages:",
+          session?.agentMessages.length,
+          "vfs:",
+          vfsFiles.length,
+        );
+        if (!session) {
+          console.error("[Chat] Session not found:", sessionId);
+          return;
+        }
+        await restoreVfs(vfsFiles);
+        currentSessionIdRef.current = session.id;
+
+        if (session.agentMessages.length > 0 && agentRef.current) {
+          agentRef.current.replaceMessages(session.agentMessages);
+        }
+
+        const uploadNames = await listUploads();
+        setState((prev) => ({
+          ...prev,
+          ...buildCanonicalState(
+            session.agentMessages,
+            prev.sessionStats.contextWindow,
+          ),
+          currentSession: session,
+          error: null,
+          uploads: uploadNames.map((name) => ({ name, size: 0 })),
+        }));
+      } catch (err) {
+        console.error("[Chat] Failed to switch session:", err);
+      }
+    },
+    [buildCanonicalState],
+  );
 
   const deleteCurrentSession = useCallback(async () => {
     if (!currentSessionIdRef.current || !workbookIdRef.current) return;
@@ -599,35 +1038,61 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       return;
     }
     agentRef.current?.reset();
-    await deleteSession(currentSessionIdRef.current);
+    const deletedId = currentSessionIdRef.current;
+    await Promise.all([deleteSession(deletedId), saveVfsFiles(deletedId, [])]);
     const session = await getOrCreateCurrentSession(workbookIdRef.current);
     currentSessionIdRef.current = session.id;
+    const vfsFiles = await loadVfsFiles(session.id);
+    await restoreVfs(vfsFiles);
+
+    if (session.agentMessages.length > 0 && agentRef.current) {
+      agentRef.current.replaceMessages(session.agentMessages);
+    }
+
     await refreshSessions();
+    const uploadNames = await listUploads();
     setState((prev) => ({
       ...prev,
-      messages: session.messages,
+      ...buildCanonicalState(
+        session.agentMessages,
+        prev.sessionStats.contextWindow,
+      ),
       currentSession: session,
       error: null,
-      sessionStats: INITIAL_STATS,
+      uploads: uploadNames.map((name) => ({ name, size: 0 })),
     }));
-  }, [refreshSessions]);
+  }, [refreshSessions, buildCanonicalState]);
 
   const prevStreamingRef = useRef(false);
   useEffect(() => {
-    if (prevStreamingRef.current && !state.isStreaming && currentSessionIdRef.current) {
+    if (
+      prevStreamingRef.current &&
+      !state.isStreaming &&
+      currentSessionIdRef.current
+    ) {
       const sessionId = currentSessionIdRef.current;
-      saveSession(sessionId, state.messages)
-        .then(async () => {
+      const agentMessages = agentRef.current?.state.messages ?? [];
+      syncCanonicalState(agentMessages);
+      // Snapshot VFS first (returns native Promise), then save to IndexedDB.
+      (async () => {
+        try {
+          const vfsFiles = await snapshotVfs();
+          await Promise.all([
+            saveSession(sessionId, agentMessages),
+            saveVfsFiles(sessionId, vfsFiles),
+          ]);
           await refreshSessions();
           const updated = await getSession(sessionId);
           if (updated) {
             setState((prev) => ({ ...prev, currentSession: updated }));
           }
-        })
-        .catch(console.error);
+        } catch (e) {
+          console.error(e);
+        }
+      })();
     }
     prevStreamingRef.current = state.isStreaming;
-  }, [state.isStreaming, state.messages, refreshSessions]);
+  }, [state.isStreaming, refreshSessions, syncCanonicalState]);
 
   useEffect(() => {
     return () => {
@@ -643,28 +1108,204 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       .then(async (id) => {
         workbookIdRef.current = id;
         console.log("[Chat] Workbook ID:", id);
-        const session = await getOrCreateCurrentSession(id);
-        currentSessionIdRef.current = session.id;
-        const sessions = await listSessions(id);
-        console.log("[Chat] Loaded session:", session.id, "with", session.messages.length, "messages");
+
+        const existingIndex = await loadWorkbookIndex(id);
         setState((prev) => ({
           ...prev,
-          messages: session.messages,
+          indexStatus: existingIndex ? "ready" : "idle",
+          indexError: null,
+          indexUpdatedAt: existingIndex?.updatedAt ?? null,
+          indexBlockCount: existingIndex?.blockCount ?? 0,
+        }));
+
+        // Load skills into VFS cache BEFORE applyConfig so the system prompt includes them
+        const skills = await getInstalledSkills();
+        skillsRef.current = skills;
+        await syncSkillsToVfs();
+        console.log(
+          "[Chat] Loaded",
+          skills.length,
+          "skills:",
+          skills.map((s) => s.name),
+        );
+        localeInfoRef.current = await loadExcelLocaleInfo();
+        console.log("[Chat] Excel locale info:", localeInfoRef.current);
+
+        // Now apply provider config — agent gets the correct system prompt with skills
+        const saved = loadSavedConfig();
+        if (saved?.provider && saved?.apiKey && saved?.model) {
+          applyConfig(saved);
+        }
+
+        const session = await getOrCreateCurrentSession(id);
+        currentSessionIdRef.current = session.id;
+        const [sessions, vfsFiles] = await Promise.all([
+          listSessions(id),
+          loadVfsFiles(session.id),
+        ]);
+        if (vfsFiles.length > 0) {
+          await restoreVfs(vfsFiles);
+        }
+
+        if (session.agentMessages.length > 0 && agentRef.current) {
+          agentRef.current.replaceMessages(session.agentMessages);
+          console.log(
+            "[Chat] Restored",
+            session.agentMessages.length,
+            "agent messages from DB",
+          );
+        }
+
+        const uploadNames = await listUploads();
+        console.log(
+          "[Chat] Loaded session:",
+          session.id,
+          "agentMessages:",
+          session.agentMessages.length,
+          "vfs:",
+          vfsFiles.length,
+        );
+        setState((prev) => ({
+          ...prev,
+          ...buildCanonicalState(
+            session.agentMessages,
+            prev.sessionStats.contextWindow,
+          ),
           currentSession: session,
           sessions,
+          skills,
+          uploads: uploadNames.map((name) => ({ name, size: 0 })),
         }));
+
+        void runWorkbookIndexJob("full");
       })
       .catch((err) => {
         console.error("[Chat] Failed to load session:", err);
       });
+  }, [applyConfig, buildCanonicalState, runWorkbookIndexJob]);
+
+  const getSheetName = useCallback(
+    (sheetId: number): string | undefined => state.sheetNames[sheetId],
+    [state.sheetNames],
+  );
+
+  const processFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+    setState((prev) => ({ ...prev, isUploading: true }));
+    try {
+      for (const file of files) {
+        const buffer = await file.arrayBuffer();
+        const data = new Uint8Array(buffer);
+        await writeFile(file.name, data);
+        setState((prev) => {
+          const exists = prev.uploads.some((u) => u.name === file.name);
+          if (exists) {
+            return {
+              ...prev,
+              uploads: prev.uploads.map((u) =>
+                u.name === file.name ? { name: file.name, size: file.size } : u,
+              ),
+            };
+          }
+          return {
+            ...prev,
+            uploads: [...prev.uploads, { name: file.name, size: file.size }],
+          };
+        });
+      }
+      if (currentSessionIdRef.current) {
+        const snapshot = await snapshotVfs();
+        await saveVfsFiles(currentSessionIdRef.current, snapshot);
+      }
+    } catch (err) {
+      console.error("Failed to upload file:", err);
+    } finally {
+      setState((prev) => ({ ...prev, isUploading: false }));
+    }
   }, []);
 
-  useEffect(() => {
-    const saved = loadSavedConfig();
-    if (saved?.provider && saved?.apiKey && saved?.model) {
-      setProviderConfig(saved);
+  const removeUpload = useCallback(async (name: string) => {
+    try {
+      await deleteFile(name);
+      setState((prev) => ({
+        ...prev,
+        uploads: prev.uploads.filter((u) => u.name !== name),
+      }));
+      if (currentSessionIdRef.current) {
+        const snapshot = await snapshotVfs();
+        await saveVfsFiles(currentSessionIdRef.current, snapshot);
+      }
+    } catch (err) {
+      console.error("Failed to delete file:", err);
+      setState((prev) => ({
+        ...prev,
+        uploads: prev.uploads.filter((u) => u.name !== name),
+      }));
     }
-  }, [setProviderConfig]);
+  }, []);
+
+  const refreshSkillsAndRebuildAgent = useCallback(async () => {
+    skillsRef.current = await getInstalledSkills();
+    setState((prev) => {
+      // Re-apply config to rebuild agent with updated system prompt
+      if (prev.providerConfig) {
+        applyConfig(prev.providerConfig);
+      }
+      return { ...prev, skills: skillsRef.current };
+    });
+  }, [applyConfig]);
+
+  const installSkill = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      try {
+        const inputs = await Promise.all(
+          files.map(async (f) => {
+            // For folder uploads, webkitRelativePath is "folderName/file.md"
+            // Strip the top-level folder to get the relative path within the skill
+            const fullPath = f.webkitRelativePath || f.name;
+            const parts = fullPath.split("/");
+            const path = parts.length > 1 ? parts.slice(1).join("/") : parts[0];
+            return { path, data: new Uint8Array(await f.arrayBuffer()) };
+          }),
+        );
+        const meta = await addSkill(inputs);
+        console.log("[Chat] Installed skill:", meta.name);
+        await refreshSkillsAndRebuildAgent();
+      } catch (err) {
+        console.error("[Chat] Failed to install skill:", err);
+        setState((prev) => ({
+          ...prev,
+          error: err instanceof Error ? err.message : "Failed to install skill",
+        }));
+      }
+    },
+    [refreshSkillsAndRebuildAgent],
+  );
+
+  const uninstallSkill = useCallback(
+    async (name: string) => {
+      try {
+        await removeSkill(name);
+        console.log("[Chat] Uninstalled skill:", name);
+        await refreshSkillsAndRebuildAgent();
+      } catch (err) {
+        console.error("[Chat] Failed to uninstall skill:", err);
+      }
+    },
+    [refreshSkillsAndRebuildAgent],
+  );
+
+  const toggleFollowMode = useCallback(() => {
+    setState((prev) => {
+      if (!prev.providerConfig) return prev;
+      const newFollowMode = !prev.providerConfig.followMode;
+      followModeRef.current = newFollowMode;
+      const newConfig = { ...prev.providerConfig, followMode: newFollowMode };
+      saveConfig(newConfig);
+      return { ...prev, providerConfig: newConfig };
+    });
+  }, []);
 
   return (
     <ChatContext.Provider
@@ -679,6 +1320,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         newSession,
         switchSession,
         deleteCurrentSession,
+        getSheetName,
+        toggleFollowMode,
+        processFiles,
+        removeUpload,
+        installSkill,
+        uninstallSkill,
+        refreshWorkbookIndex,
       }}
     >
       {children}

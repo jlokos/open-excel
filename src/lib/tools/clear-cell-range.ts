@@ -12,9 +12,16 @@ export const clearCellRangeTool = defineTool({
     sheetId: Type.Number({ description: "The worksheet ID (1-based index)" }),
     range: Type.String({ description: "Range to clear in A1 notation" }),
     clearType: Type.Optional(
-      Type.Union([Type.Literal("contents"), Type.Literal("all"), Type.Literal("formats")], {
-        description: "What to clear. Default: 'contents'",
-      }),
+      Type.Union(
+        [
+          Type.Literal("contents"),
+          Type.Literal("all"),
+          Type.Literal("formats"),
+        ],
+        {
+          description: "What to clear. Default: 'contents'",
+        },
+      ),
     ),
     explanation: Type.Optional(
       Type.String({
@@ -23,12 +30,20 @@ export const clearCellRangeTool = defineTool({
       }),
     ),
   }),
+  dirtyTracking: {
+    getRanges: (p) => [{ sheetId: p.sheetId, range: p.range }],
+  },
   execute: async (_toolCallId, params) => {
     try {
-      const result = await clearCellRange(params.sheetId, params.range, params.clearType);
+      const result = await clearCellRange(
+        params.sheetId,
+        params.range,
+        params.clearType,
+      );
       return toolSuccess(result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error clearing cells";
+      const message =
+        error instanceof Error ? error.message : "Unknown error clearing cells";
       return toolError(message);
     }
   },

@@ -4,11 +4,23 @@ import { defineTool, toolError, toolSuccess } from "./types";
 
 const SearchOptionsSchema = Type.Optional(
   Type.Object({
-    matchCase: Type.Optional(Type.Boolean({ description: "Case sensitive. Default: false" })),
-    matchEntireCell: Type.Optional(Type.Boolean({ description: "Match entire cell content. Default: false" })),
-    matchFormulas: Type.Optional(Type.Boolean({ description: "Search in formulas. Default: false" })),
-    useRegex: Type.Optional(Type.Boolean({ description: "Use regex pattern. Default: false" })),
-    maxResults: Type.Optional(Type.Number({ description: "Max results. Default: 500" })),
+    matchCase: Type.Optional(
+      Type.Boolean({ description: "Case sensitive. Default: false" }),
+    ),
+    matchEntireCell: Type.Optional(
+      Type.Boolean({
+        description: "Match entire cell content. Default: false",
+      }),
+    ),
+    matchFormulas: Type.Optional(
+      Type.Boolean({ description: "Search in formulas. Default: false" }),
+    ),
+    useRegex: Type.Optional(
+      Type.Boolean({ description: "Use regex pattern. Default: false" }),
+    ),
+    maxResults: Type.Optional(
+      Type.Number({ description: "Max results. Default: 500" }),
+    ),
   }),
 );
 
@@ -20,14 +32,23 @@ export const searchDataTool = defineTool({
     "Returns matching cells with their addresses and values. " +
     "Supports regex and case-sensitive search.",
   parameters: Type.Object({
-    searchTerm: Type.String({ description: "The text or pattern to search for" }),
-    sheetId: Type.Optional(Type.Number({ description: "Limit to specific sheet" })),
-    range: Type.Optional(Type.String({ description: "Limit search scope, e.g. 'A1:Z100'" })),
-    offset: Type.Optional(Type.Number({ description: "Pagination offset. Default: 0" })),
+    searchTerm: Type.String({
+      description: "The text or pattern to search for",
+    }),
+    sheetId: Type.Optional(
+      Type.Number({ description: "Limit to specific sheet" }),
+    ),
+    range: Type.Optional(
+      Type.String({ description: "Limit search scope, e.g. 'A1:Z100'" }),
+    ),
+    offset: Type.Optional(
+      Type.Number({ description: "Pagination offset. Default: 0" }),
+    ),
     options: SearchOptionsSchema,
     explanation: Type.Optional(
       Type.String({
-        description: "Brief explanation of what you're searching (max 50 chars)",
+        description:
+          "Brief explanation of what you're searching (max 50 chars)",
         maxLength: 50,
       }),
     ),
@@ -42,7 +63,8 @@ export const searchDataTool = defineTool({
       });
       return toolSuccess(result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error searching";
+      const message =
+        error instanceof Error ? error.message : "Unknown error searching";
       return toolError(message);
     }
   },

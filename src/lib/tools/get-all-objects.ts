@@ -9,7 +9,9 @@ export const getAllObjectsTool = defineTool({
     "List all charts, pivot tables, and other objects in the workbook. " +
     "Use this to discover what visualizations exist before modifying them.",
   parameters: Type.Object({
-    sheetId: Type.Optional(Type.Number({ description: "Filter to specific sheet" })),
+    sheetId: Type.Optional(
+      Type.Number({ description: "Filter to specific sheet" }),
+    ),
     id: Type.Optional(Type.String({ description: "Filter by object ID" })),
     explanation: Type.Optional(
       Type.String({
@@ -26,7 +28,10 @@ export const getAllObjectsTool = defineTool({
       });
       return toolSuccess(result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error getting objects";
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unknown error getting objects";
       return toolError(message);
     }
   },

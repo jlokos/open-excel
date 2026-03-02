@@ -41,7 +41,8 @@ export const getCellRangesTool = defineTool({
       });
       return toolSuccess(result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error reading cells";
+      const message =
+        error instanceof Error ? error.message : "Unknown error reading cells";
       return toolError(message);
     }
   },

@@ -1,7 +1,23 @@
 import { Type } from "@sinclair/typebox";
+import type { DirtyRange } from "../dirty-tracker";
+import { createTrackedContext } from "../excel/tracked-context";
+import { sandboxedEval } from "../sandbox";
 import { defineTool, toolError, toolSuccess } from "./types";
 
 /* global Excel */
+
+const MUTATION_PATTERNS = [
+  /\.(values|formulas|numberFormat)\s*=/,
+  /\.clear\s*\(/,
+  /\.delete\s*\(/,
+  /\.insert\s*\(/,
+  /\.copyFrom\s*\(/,
+  /\.add\s*\(/,
+];
+
+function looksLikeMutation(code: string): boolean {
+  return MUTATION_PATTERNS.some((p) => p.test(code));
+}
 
 export const evalOfficeJsTool = defineTool({
   name: "eval_officejs",
@@ -27,14 +43,36 @@ export const evalOfficeJsTool = defineTool({
   }),
   execute: async (_toolCallId, params) => {
     try {
+      let dirtyRanges: DirtyRange[] = [];
+
       const result = await Excel.run(async (context) => {
-        const wrappedCode = `return (async () => { ${params.code} })()`;
-        const fn = new Function("context", "Excel", wrappedCode);
-        return await fn(context, Excel);
+        const { trackedContext, getDirtyRanges } =
+          createTrackedContext(context);
+
+        const execResult = await sandboxedEval(params.code, {
+          context: trackedContext,
+          Excel,
+        });
+
+        dirtyRanges = getDirtyRanges();
+        return execResult;
       });
-      return toolSuccess({ success: true, result: result ?? null });
+
+      if (dirtyRanges.length === 0 && looksLikeMutation(params.code)) {
+        dirtyRanges = [{ sheetId: -1, range: "*" }];
+      }
+
+      const response: Record<string, unknown> = {
+        success: true,
+        result: result ?? null,
+      };
+      if (dirtyRanges.length > 0) {
+        response._dirtyRanges = dirtyRanges;
+      }
+      return toolSuccess(response);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error executing code";
+      const message =
+        error instanceof Error ? error.message : "Unknown error executing code";
       return toolError(message);
     }
   },

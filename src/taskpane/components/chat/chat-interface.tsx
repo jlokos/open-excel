@@ -1,5 +1,26 @@
-import { Check, ChevronDown, MessageSquare, Moon, Plus, Settings, Sun, Trash2 } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import {
+  Check,
+  ChevronDown,
+  Eye,
+  EyeOff,
+  MessageSquare,
+  Moon,
+  Plus,
+  RefreshCw,
+  Settings,
+  Sun,
+  Trash2,
+  Upload,
+} from "lucide-react";
+import {
+  type DragEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { getSessionMessageCount } from "../../../lib/storage";
 import { ChatProvider, useChat } from "./chat-context";
 import { ChatInput } from "./chat-input";
 import { MessageList } from "./message-list";
@@ -12,7 +33,11 @@ const THEME_KEY = "openexcel-theme";
 function useTheme() {
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem(THEME_KEY) as Theme | null;
-    const initial = saved ?? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    const initial =
+      saved ??
+      (window.matchMedia("(prefers-color-scheme: light)").matches
+        ? "light"
+        : "dark");
     document.documentElement.setAttribute("data-theme", initial);
     return initial;
   });
@@ -44,9 +69,13 @@ function StatsBar() {
 
   if (!providerConfig) return null;
 
-  const totalTokens = sessionStats.inputTokens + sessionStats.outputTokens;
   const contextPct =
-    sessionStats.contextWindow > 0 ? ((totalTokens / sessionStats.contextWindow) * 100).toFixed(1) : "0";
+    sessionStats.contextWindow > 0 && sessionStats.lastInputTokens > 0
+      ? (
+          (sessionStats.lastInputTokens / sessionStats.contextWindow) *
+          100
+        ).toFixed(1)
+      : "0";
 
   return (
     <div
@@ -54,11 +83,21 @@ function StatsBar() {
       style={{ fontFamily: "var(--chat-font-mono)" }}
     >
       <div className="flex items-center gap-3">
-        <span title="Input tokens">↑{formatTokens(sessionStats.inputTokens)}</span>
-        <span title="Output tokens">↓{formatTokens(sessionStats.outputTokens)}</span>
-        {sessionStats.cacheRead > 0 && <span title="Cache read tokens">R{formatTokens(sessionStats.cacheRead)}</span>}
+        <span title="Input tokens">
+          ↑{formatTokens(sessionStats.inputTokens)}
+        </span>
+        <span title="Output tokens">
+          ↓{formatTokens(sessionStats.outputTokens)}
+        </span>
+        {sessionStats.cacheRead > 0 && (
+          <span title="Cache read tokens">
+            R{formatTokens(sessionStats.cacheRead)}
+          </span>
+        )}
         {sessionStats.cacheWrite > 0 && (
-          <span title="Cache write tokens">W{formatTokens(sessionStats.cacheWrite)}</span>
+          <span title="Cache write tokens">
+            W{formatTokens(sessionStats.cacheWrite)}
+          </span>
         )}
         <span title="Total cost">{formatCost(sessionStats.totalCost)}</span>
         {sessionStats.contextWindow > 0 && (
@@ -69,16 +108,28 @@ function StatsBar() {
       </div>
       <div className="flex items-center gap-1">
         <span>{providerConfig.provider}</span>
-        <span className="text-(--chat-text-secondary)">{providerConfig.model}</span>
+        <span className="text-(--chat-text-secondary)">
+          {providerConfig.model}
+        </span>
         {providerConfig.thinking !== "none" && (
-          <span className="text-(--chat-accent)">• {providerConfig.thinking}</span>
+          <span className="text-(--chat-accent)">
+            • {providerConfig.thinking}
+          </span>
         )}
       </div>
     </div>
   );
 }
 
-function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
+function TabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
   return (
     <button
       type="button"
@@ -107,7 +158,10 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+      if (
+        dropdownRef.current &&
+        !dropdownRef.current.contains(e.target as Node)
+      ) {
         setOpen(false);
       }
     };
@@ -116,7 +170,8 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
   }, [open]);
 
   const currentName = state.currentSession?.name ?? "New Chat";
-  const truncatedName = currentName.length > 20 ? `${currentName.slice(0, 18)}…` : currentName;
+  const truncatedName =
+    currentName.length > 20 ? `${currentName.slice(0, 18)}…` : currentName;
 
   const handleNewSession = async () => {
     console.log("[UI] handleNewSession clicked");
@@ -145,7 +200,10 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
       >
         <MessageSquare size={12} />
         <span className="max-w-[100px] truncate">{truncatedName}</span>
-        <ChevronDown size={12} className={`transition-transform ${open ? "rotate-180" : ""}`} />
+        <ChevronDown
+          size={12}
+          className={`transition-transform ${open ? "rotate-180" : ""}`}
+        />
       </button>
 
       {open && (
@@ -185,13 +243,20 @@ function SessionDropdown({ onSelect }: { onSelect: () => void }) {
                 >
                   <div className="flex items-center gap-2 min-w-0 flex-1">
                     {session.id === state.currentSession?.id ? (
-                      <Check size={12} className="text-(--chat-accent) shrink-0" />
+                      <Check
+                        size={12}
+                        className="text-(--chat-accent) shrink-0"
+                      />
                     ) : (
                       <div className="w-3 shrink-0" />
                     )}
-                    <span className="truncate text-(--chat-text-primary)">{session.name}</span>
+                    <span className="truncate text-(--chat-text-primary)">
+                      {session.name}
+                    </span>
                   </div>
-                  <span className="text-[10px] text-(--chat-text-muted) shrink-0 ml-2">{session.messages.length}</span>
+                  <span className="text-[10px] text-(--chat-text-muted) shrink-0 ml-2">
+                    {getSessionMessageCount(session)}
+                  </span>
                 </button>
               );
             })}
@@ -233,7 +298,23 @@ function ChatHeader({
   theme: Theme;
   onThemeToggle: () => void;
 }) {
-  const { clearMessages, state } = useChat();
+  const { clearMessages, state, toggleFollowMode, refreshWorkbookIndex } =
+    useChat();
+  const followMode = state.providerConfig?.followMode ?? true;
+  const indexStatusLabel: Record<typeof state.indexStatus, string> = {
+    idle: "index idle",
+    indexing: "indexing",
+    ready: `index ${state.indexBlockCount}`,
+    stale: "index stale",
+    error: "index error",
+  };
+  const indexStatusClass: Record<typeof state.indexStatus, string> = {
+    idle: "text-(--chat-text-muted)",
+    indexing: "text-(--chat-accent)",
+    ready: "text-(--chat-text-secondary)",
+    stale: "text-(--chat-text-primary)",
+    error: "text-(--chat-error)",
+  };
 
   return (
     <div className="border-b border-(--chat-border) bg-(--chat-bg)">
@@ -247,17 +328,72 @@ function ChatHeader({
               Chat
             </TabButton>
           )}
-          <TabButton active={activeTab === "settings"} onClick={() => onTabChange("settings")}>
+          <TabButton
+            active={activeTab === "settings"}
+            onClick={() => onTabChange("settings")}
+          >
             <Settings size={12} />
             Settings
           </TabButton>
         </div>
         <div className="flex items-center">
+          {activeTab === "chat" && (
+            <>
+              <span
+                className={`text-[10px] uppercase tracking-wider px-1.5 ${indexStatusClass[state.indexStatus]}`}
+                title={
+                  state.indexError ||
+                  (state.indexUpdatedAt
+                    ? `Updated ${new Date(state.indexUpdatedAt).toLocaleTimeString()}`
+                    : "Workbook style index status")
+                }
+                style={{ fontFamily: "var(--chat-font-mono)" }}
+              >
+                {indexStatusLabel[state.indexStatus]}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  void refreshWorkbookIndex();
+                }}
+                disabled={state.indexStatus === "indexing"}
+                className="p-1.5 text-(--chat-text-muted) hover:text-(--chat-text-primary) disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                title="Refresh workbook index"
+              >
+                <RefreshCw
+                  size={14}
+                  className={
+                    state.indexStatus === "indexing" ? "animate-spin" : ""
+                  }
+                />
+              </button>
+            </>
+          )}
+          {activeTab === "chat" && (
+            <button
+              type="button"
+              onClick={toggleFollowMode}
+              className={`p-1.5 transition-colors ${
+                followMode
+                  ? "text-(--chat-accent) hover:text-(--chat-text-primary)"
+                  : "text-(--chat-text-muted) hover:text-(--chat-text-primary)"
+              }`}
+              title={
+                followMode
+                  ? "Follow mode: ON - Click to disable"
+                  : "Follow mode: OFF - Click to enable"
+              }
+            >
+              {followMode ? <Eye size={14} /> : <EyeOff size={14} />}
+            </button>
+          )}
           <button
             type="button"
             onClick={onThemeToggle}
             className="p-1.5 text-(--chat-text-muted) hover:text-(--chat-text-primary) transition-colors"
-            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            title={
+              theme === "dark" ? "Switch to light mode" : "Switch to dark mode"
+            }
           >
             {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
           </button>
@@ -280,10 +416,63 @@ function ChatHeader({
 function ChatContent() {
   const [activeTab, setActiveTab] = useState<ChatTab>("chat");
   const { theme, toggle } = useTheme();
+  const { processFiles } = useChat();
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounterRef = useRef(0);
+
+  const handleDragEnter = useCallback((e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current++;
+    if (e.dataTransfer.types.includes("Files")) {
+      setIsDragOver(true);
+    }
+  }, []);
+
+  const handleDragLeave = useCallback((e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current--;
+    if (dragCounterRef.current === 0) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handleDragOver = useCallback((e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback(
+    (e: DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounterRef.current = 0;
+      setIsDragOver(false);
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length > 0) {
+        processFiles(files);
+      }
+    },
+    [processFiles],
+  );
 
   return (
-    <div className="flex flex-col h-full bg-(--chat-bg)" style={{ fontFamily: "var(--chat-font-mono)" }}>
-      <ChatHeader activeTab={activeTab} onTabChange={setActiveTab} theme={theme} onThemeToggle={toggle} />
+    <div
+      role="application"
+      className="flex flex-col h-full bg-(--chat-bg) relative"
+      style={{ fontFamily: "var(--chat-font-mono)" }}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
+      <ChatHeader
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+        theme={theme}
+        onThemeToggle={toggle}
+      />
       {activeTab === "chat" ? (
         <>
           <MessageList />
@@ -292,6 +481,18 @@ function ChatContent() {
         </>
       ) : (
         <SettingsPanel />
+      )}
+
+      {/* Drag-and-drop overlay */}
+      {isDragOver && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-(--chat-bg)/80 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-3 p-8 border-2 border-dashed border-(--chat-accent) rounded-lg">
+            <Upload size={32} className="text-(--chat-accent)" />
+            <span className="text-sm text-(--chat-text-primary)">
+              Drop files here
+            </span>
+          </div>
+        </div>
       )}
     </div>
   );

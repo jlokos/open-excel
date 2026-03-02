@@ -2,6 +2,12 @@
 @source "../**/*.{ts,tsx,html}";
 @source "../../node_modules/streamdown/dist/*.js";
 
+@custom-variant dark (&:where([data-theme="dark"] *));
+
+html {
+  font-size: 14px;
+}
+
 :root {
   --chat-font-mono: "SF Mono", "Monaco", "Inconsolata", "Roboto Mono", "Consolas", monospace;
   --chat-bg: #0a0a0a;
@@ -21,6 +27,9 @@
   --chat-scrollbar-hover: #444444;
   --chat-success: #22c55e;
   --chat-error: #ef4444;
+  --chat-warning: #f59e0b;
+  --chat-warning-muted: #b45309;
+  --chat-warning-bg: rgba(245, 158, 11, 0.1);
   --chat-radius: 2px;
 }
 
@@ -40,6 +49,9 @@
   --chat-input-bg: #ffffff;
   --chat-scrollbar: #d0d0d0;
   --chat-scrollbar-hover: #b0b0b0;
+  --chat-warning: #d97706;
+  --chat-warning-muted: #92400e;
+  --chat-warning-bg: rgba(217, 119, 6, 0.12);
 }
 
 .markdown-content {
